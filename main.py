@@ -15,15 +15,16 @@
 
 import logging
 import os
+import shutil
 import sys
 
 import click
-from config import EXCLUDE_FOLDER, INCLUDE_BLOCKS
+from config import EXCLUDE_FOLDER, INCLUDE_BLOCKS, PLAYBOOKS_PATH
 from constants import PLAYBOOKS_ROOT_README
 from jinja2 import Template
 from manager import ResponseManager
 from models import SocRole, Workflow, WorkflowMenuCard
-from utils import get_local_playbooks, remove_stale_playbooks
+from utils import WD, get_local_playbooks
 
 LOGGER = logging.getLogger("rac")
 
@@ -106,8 +107,12 @@ def pull_playbooks():
 
     try:
         installed_playbooks: list[WorkflowMenuCard] = response_manager.get_playbooks()
-        # Identifier to repo path of every stored playbook and block
-        stored_paths: dict[str, str] = {}
+
+        # The repo mirrors the instance, so start from an empty playbooks folder.
+        # Renamed, moved and deleted playbooks then don't leave old files behind.
+        playbooks_dir = os.path.join(WD, PLAYBOOKS_PATH)
+        if os.path.isdir(playbooks_dir):
+            shutil.rmtree(playbooks_dir)
 
         for playbook in installed_playbooks:
             if EXCLUDE_FOLDER and EXCLUDE_FOLDER in playbook.categoryName:
@@ -136,9 +141,7 @@ def pull_playbooks():
 
             response_manager.update_instance_name_in_steps(playbook_details)
 
-            stored_paths[playbook_details.raw_data.get("identifier")] = (
-                response_manager.store_playbook(playbook_details)
-            )
+            response_manager.store_playbook(playbook_details)
 
             if include_blocks:
                 for block in playbook_details.get_involved_blocks():
@@ -159,11 +162,7 @@ def pull_playbooks():
                         response_manager.get_playbook(installed_block.identifier)
                     )
                     response_manager.update_instance_name_in_steps(block_details)
-                    stored_paths[block_details.raw_data.get("identifier")] = (
-                        response_manager.store_playbook(block_details)
-                    )
-
-        remove_stale_playbooks(stored_paths)
+                    response_manager.store_playbook(block_details)
 
         #response_manager.update_readme(create_root_readme(), "Playbooks")
 

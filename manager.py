@@ -62,16 +62,14 @@ class ResponseManager:
         """Retrieves full information for a legacy playbooks or block by its identifier."""
         return self.client.get_playbook(identifier)
 
-    def store_playbook(self, playbook: Workflow) -> str:
+    def store_playbook(self, playbook: Workflow) -> None:
         """Writes a workflow to the repo
 
         Args:
             playbook: A playbook object
 
-        Returns: The path of the playbook folder, relative to the repo
-
         """
-        return push_playbook(playbook)
+        push_playbook(playbook)
 
     def install_playbooks(self, workflows: list[Workflow]) -> None:
         """Install or update playbooks and blocks

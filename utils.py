@@ -42,66 +42,33 @@ def get_local_playbooks() -> Iterator[Workflow]:
     Raises:
         ValueError: If two playbooks in the repo have the same name.
     """
-    seen: dict[str, str] = {}
-    for path, is_dir in _iter_playbook_paths():
-        playbook = _read_playbook_dir(path) if is_dir else Workflow(_read_json(path))
-        if playbook.name in seen:
-            raise ValueError(
-                f"Playbook '{playbook.name}' is stored twice: "
-                f"{seen[playbook.name]} and {path}"
-            )
-        seen[playbook.name] = path
-        yield playbook
-
-
-def _iter_playbook_paths() -> Iterator[tuple[str, bool]]:
-    """Yields the absolute path of every playbook in the repo, and whether it's a
-    playbook folder (True) or a legacy single-file playbook (False).
-    """
     root = os.path.join(WD, PLAYBOOKS_PATH)
     if not os.path.isdir(root):
         LOGGER.warning(f"Playbooks path not found: {root}")
         return
 
+    seen: dict[str, str] = {}
     for dir_path, dir_names, file_names in os.walk(root):
         dir_names.sort()
         if PLAYBOOK_DEFINITION_FILE in file_names:
             # The steps folder belongs to this playbook, don't descend into it
             dir_names.clear()
-            yield dir_path, True
+            playbooks = [(dir_path, _read_playbook_dir(dir_path))]
         else:
-            for file_name in sorted(file_names):
-                if file_name.endswith(".json"):
-                    yield os.path.join(dir_path, file_name), False
+            playbooks = [
+                (path, Workflow(_read_json(path)))
+                for path in (os.path.join(dir_path, f) for f in sorted(file_names))
+                if path.endswith(".json")
+            ]
 
-
-def remove_stale_playbooks(stored_paths: dict[str, str]) -> None:
-    """Removes old copies of playbooks that were just stored at another path.
-
-    Renaming a playbook (or moving it to another category) changes its folder,
-    which leaves the old folder or legacy file behind with the same identifier.
-
-    Args:
-        stored_paths: Mapping of playbook identifier to the path (relative to the
-            repo) the playbook was just stored at.
-    """
-    stored_paths = {
-        identifier: os.path.normpath(os.path.join(WD, path))
-        for identifier, path in stored_paths.items()
-        if identifier
-    }
-    # Collect first, the walk must not run over removed folders
-    for path, is_dir in list(_iter_playbook_paths()):
-        definition_path = os.path.join(path, PLAYBOOK_DEFINITION_FILE) if is_dir else path
-        identifier = _read_json(definition_path).get("identifier")
-        stored_path = stored_paths.get(identifier)
-        if stored_path is None or os.path.normpath(path) == stored_path:
-            continue
-        LOGGER.info(f"Removing old copy of playbook {stored_path}: {path}")
-        if is_dir:
-            shutil.rmtree(path)
-        else:
-            os.remove(path)
+        for path, playbook in playbooks:
+            if playbook.name in seen:
+                raise ValueError(
+                    f"Playbook '{playbook.name}' is stored twice: "
+                    f"{seen[playbook.name]} and {path}"
+                )
+            seen[playbook.name] = path
+            yield playbook
 
 
 def _read_playbook_dir(playbook_dir: str) -> Workflow:
@@ -125,11 +92,8 @@ def _read_json(path: str) -> dict:
         return json.load(f)
 
 
-def push_playbook(playbook: Workflow) -> str:
+def push_playbook(playbook: Workflow) -> None:
     """Writes a workflow to the repo in the content-hub layout.
-
-    Returns:
-        The path of the playbook folder, relative to the repo.
 
     Raises:
         ValueError: If the playbook folder already holds another playbook, which
@@ -140,14 +104,8 @@ def push_playbook(playbook: Workflow) -> str:
 
     definition_path = os.path.join(WD, path, PLAYBOOK_DEFINITION_FILE)
     if os.path.isfile(definition_path):
-        stored = _read_json(definition_path)
-        stored_name = stored.get("name")
-        # The same playbook may be stored under a name that maps to the same
-        # folder, e.g. after renaming "My Playbook" to "My-Playbook"
-        if (
-            stored_name != playbook.name
-            and stored.get("identifier") != playbook.raw_data.get("identifier")
-        ):
+        stored_name = _read_json(definition_path).get("name")
+        if stored_name != playbook.name:
             raise ValueError(
                 f"Can't store playbook '{playbook.name}' in {path}: "
                 f"the folder already holds playbook '{stored_name}'"
@@ -158,7 +116,6 @@ def push_playbook(playbook: Workflow) -> str:
     update_objects(
         playbook.iter_files(), base_path=path, replace_content_in_base_path=True
     )
-    return path
 
 def update_objects(
     files: list[File], base_path: str = "", replace_content_in_base_path: bool = False
