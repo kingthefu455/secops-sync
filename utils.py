@@ -20,7 +20,12 @@ import shutil
 from collections.abc import Iterator
 
 import playbook_format
-from config import  PLAYBOOK_DEFINITION_FILE,PLAYBOOK_STEPS_DIR, PLAYBOOKS_PATH
+from config import (
+    PLAYBOOK_DEFINITION_FILE,
+    PLAYBOOK_STEPS_DIR,
+    PLAYBOOK_WIDGETS_DIR,
+    PLAYBOOKS_PATH,
+)
 from models import File, Workflow
 
 LOGGER = logging.getLogger("rac")
@@ -72,7 +77,7 @@ def get_local_playbooks() -> Iterator[Workflow]:
 
 
 def _read_playbook_dir(playbook_dir: str) -> Workflow:
-    """Reassembles a playbook from its definition, trigger, overview and step files."""
+    """Reassembles a playbook from its definition, trigger, overview, step and widget files."""
     files = {
         file_name: _read_json(os.path.join(playbook_dir, file_name))
         for file_name in os.listdir(playbook_dir)
@@ -84,6 +89,15 @@ def _read_playbook_dir(playbook_dir: str) -> Workflow:
             if file_name.endswith(".json"):
                 path = f"{PLAYBOOK_STEPS_DIR}/{file_name}"
                 files[path] = _read_json(os.path.join(steps_dir, file_name))
+    widgets_dir = os.path.join(playbook_dir, PLAYBOOK_WIDGETS_DIR)
+    if os.path.isdir(widgets_dir):
+        for file_name in os.listdir(widgets_dir):
+            if file_name.endswith(".html"):
+                # newline="" keeps the line endings of the HTML as they are
+                with open(
+                    os.path.join(widgets_dir, file_name), encoding="utf-8", newline=""
+                ) as f:
+                    files[f"{PLAYBOOK_WIDGETS_DIR}/{file_name}"] = f.read()
     return Workflow(playbook_format.from_files(files))
 
 
