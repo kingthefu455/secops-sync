@@ -22,19 +22,18 @@
         widgets/<widget_title>_<widget_description>.json
         widgets/<widget_title>_<widget_description>.html
 
-Every widget of the overview templates is moved to its own JSON file.
-overviews.json then only holds the templates with references to the widget
-files, as {"$file": ...}.
+Every widget of the overview templates is moved to its own JSON file with its
+data as the API returns it. overviews.json then holds the templates with
+references to the widget files, as {"$file": ...}, and is otherwise unchanged.
 
-Like content-hub's mp tool, the data definition the API holds as JSON text
-(dataDefinitionJson) is stored parsed as dataDefinition. For HTML widgets it
-uses mp's widget data definition (html_height, safe_rendering, type,
-widget_definition_scope, with types and scopes by name), and the HTML is
-stored in the .html file of the same name, with its real line breaks. Other
-widgets keep their data definition as parsed.
+Only widgets with HTML content also get an HTML file: the data definition the
+API holds as JSON text (dataDefinitionJson) is stored parsed, without its
+htmlContent, and the HTML is stored in the .html file of the same name with
+its real line breaks, like content-hub's mp tool does. The data definition of
+other widgets stays as it is.
 
-Overview and widget files have sorted keys, so they only change when the
-content does, not when the API orders or formats the data differently.
+Overview and widget files have sorted keys, so they don't change when the API
+orders the keys differently.
 """
 
 from __future__ import annotations
@@ -66,35 +65,10 @@ _FILE_MARKER = "$file"
 _JSON_MARKER = "$json"
 # Key of the widget list in an overview template
 _WIDGETS_KEY = "widgets"
-# Key holding the position of a widget in its template
-_ORDER_KEY = "order"
-# Widget data definition: JSON text in the API, parsed in widget files
+# Widget data definition, JSON text in the API
 _DATA_JSON_KEY = "dataDefinitionJson"
-_DATA_KEY = "dataDefinition"
-# Key of widget HTML in the data definition of HTML widgets
+# Key of widget HTML in the data definition, same as content-hub
 _HTML_KEY = "htmlContent"
-
-# content-hub's WidgetType and WidgetDefinitionScope, stored by name like mp
-_WIDGET_TYPES = {
-    0: "key_value", 1: "events", 2: "json_result", 3: "html", 4: "wall_activities",
-    5: "alerts", 6: "timeline", 7: "graph", 8: "text", 9: "potentially_grouped_alerts",
-    10: "entities_highlights", 11: "pending_steps", 12: "case_recommendations",
-    13: "statistics", 14: "case_description", 15: "insight", 16: "case_assistant",
-    17: "case_aps_graph", 18: "case_related_findings", 19: "case_impacted_resources",
-    20: "form", 21: "quick_actions", 22: "composite_alert", 23: "rule_overview",
-    24: "case_detections", 25: "udm_events", 26: "udm_entities", 27: "event_highlights",
-    28: "threat_hunt", 29: "third_party",
-}
-_HTML_WIDGET_TYPE = 3
-_WIDGET_SCOPES = {0: "case", 1: "alert", 2: "both"}
-# content-hub's HtmlWidgetDataDefinition: API key -> (widget file key, names)
-_HTML_DATA_FIELDS = {
-    "htmlHeight": ("html_height", None),
-    "safeRendering": ("safe_rendering", None),
-    "type": ("type", _WIDGET_TYPES),
-    "widgetDefinitionScope": ("widget_definition_scope", _WIDGET_SCOPES),
-}
-_HTML_DATA_API_KEYS = {key: api_key for api_key, (key, _) in _HTML_DATA_FIELDS.items()}
 # Widget file names are cut to stay below file system limits
 _MAX_WIDGET_NAME = 120
 
@@ -183,10 +157,6 @@ def _split_overviews(value: Any, files: dict[str, Any]) -> Any:
             refs: list[Any] = [None] * len(item)
             for i in sorted(range(len(item)), key=lambda i: json.dumps(item[i], sort_keys=True)):
                 refs[i] = _split_widget(item[i], files)
-            # With an order field in every widget, the list order carries no
-            # information, so sort it to keep overviews.json stable.
-            if all(isinstance(w, dict) and _ORDER_KEY in w for w in item):
-                refs.sort(key=lambda ref: ref[_FILE_MARKER])
             result[key] = refs
         else:
             result[key] = _split_overviews(item, files)
@@ -194,8 +164,8 @@ def _split_overviews(value: Any, files: dict[str, Any]) -> Any:
 
 
 def _split_widget(widget: Any, files: dict[str, Any]) -> Any:
-    """Moves a widget to widgets/<title>_<description>.json, with its data
-    definition parsed and, for HTML widgets, its HTML in the .html file."""
+    """Moves a widget to widgets/<title>_<description>.json and, when it has
+    HTML content, the HTML to the .html file of the same name."""
     if not isinstance(widget, dict):
         return widget
     base = widget_file_name(
@@ -206,29 +176,21 @@ def _split_widget(widget: Any, files: dict[str, Any]) -> Any:
     widget = dict(widget)
     data_text = widget.get(_DATA_JSON_KEY)
     data = _parse_json_object(data_text) if isinstance(data_text, str) else None
-    if data is not None:
-        del widget[_DATA_JSON_KEY]
-        if _is_html_widget(widget):
-            html = data.pop(_HTML_KEY, "") if isinstance(data.get(_HTML_KEY), str) else ""
-            if html:
-                files[_html_path(path)] = html
-            data = _to_html_data_definition(data)
-        widget[_DATA_KEY] = data
+    if data is not None and isinstance(data.get(_HTML_KEY), str) and data[_HTML_KEY]:
+        files[_html_path(path)] = data.pop(_HTML_KEY)
+        widget[_DATA_JSON_KEY] = data
     files[path] = _sort_keys(widget)
     return {_FILE_MARKER: path}
 
 
 def _join_widget(path: str, files: dict[str, Any]) -> Any:
-    """Reverses _split_widget: turns the widget file back into API data."""
+    """Reverses _split_widget: puts the HTML back into the data definition text."""
     widget = _join_text(files[path], files)
-    if not isinstance(widget, dict) or _DATA_KEY not in widget:
-        return widget
-    data = widget.pop(_DATA_KEY)
-    if _is_html_widget(widget) and isinstance(data, dict):
-        data = _from_html_data_definition(data)
-        # Like mp, HTML widgets always hold htmlContent, empty without a file
-        data[_HTML_KEY] = files.get(_html_path(path), data.get(_HTML_KEY, ""))
-    widget[_DATA_JSON_KEY] = json.dumps(data, ensure_ascii=False)
+    if isinstance(widget, dict) and isinstance(widget.get(_DATA_JSON_KEY), dict):
+        data = dict(widget[_DATA_JSON_KEY])
+        if _html_path(path) in files:
+            data[_HTML_KEY] = files[_html_path(path)]
+        widget[_DATA_JSON_KEY] = json.dumps(data, ensure_ascii=False)
     return widget
 
 
@@ -238,36 +200,6 @@ def _html_path(widget_path: str) -> str:
 
 def _text(value: Any) -> str | None:
     return value if isinstance(value, str) else None
-
-
-def _is_html_widget(widget: dict) -> bool:
-    widget_type = widget.get("type")
-    if isinstance(widget_type, str):
-        return widget_type.casefold() == _WIDGET_TYPES[_HTML_WIDGET_TYPE]
-    return widget_type == _HTML_WIDGET_TYPE and not isinstance(widget_type, bool)
-
-
-def _to_html_data_definition(data: dict) -> dict:
-    """Converts an API data definition to mp's. Unknown keys and values are kept."""
-    result = {}
-    for api_key, value in data.items():
-        key, names = _HTML_DATA_FIELDS.get(api_key, (api_key, None))
-        if names and isinstance(value, int) and value in names:
-            value = names[value]
-        result[key] = value
-    return result
-
-
-def _from_html_data_definition(data: dict) -> dict:
-    """Reverses _to_html_data_definition."""
-    result = {}
-    for key, value in data.items():
-        api_key = _HTML_DATA_API_KEYS.get(key, key)
-        names = _HTML_DATA_FIELDS.get(api_key, (None, None))[1]
-        if names and isinstance(value, str):
-            value = next((number for number, name in names.items() if name == value), value)
-        result[api_key] = value
-    return result
 
 
 def _parse_json_object(text: str) -> dict | None:
