@@ -23,14 +23,15 @@
         widgets/<widget_title>_<widget_description>.html
 
 Every widget of the overview templates is moved to its own JSON file with all
-its data as the API returns it, and removed from overviews.json. Before a push,
-the widgets are put back into their template: the one whose identifier the
-widget holds (templateIdentifier), or the only template of the playbook.
+its data (metadata and config) as the API returns it, and removed from
+overviews.json. Before a push, the widgets are put back into their template:
+the one whose identifier the widget holds (templateIdentifier), or the only
+template of the playbook.
 
-HTML widgets also get an HTML file, like content-hub's mp tool does: the data
-definition the API holds as JSON text (dataDefinitionJson) is stored parsed,
-without its htmlContent, and the HTML is stored in the .html file of the same
-name with its real line breaks. The data of other widgets stays as it is.
+HTML widgets also get an HTML file, like content-hub's mp tool does: the
+htmlContent of their config is stored in the .html file of the same name with
+its real line breaks, and left out of the widget file. The data of other
+widgets stays as it is.
 
 Overview and widget files have sorted keys, so they don't change when the API
 orders the keys differently.
@@ -70,14 +71,17 @@ _TEMPLATE_KEY = "overviewTemplate"
 _TEMPLATE_ID_KEY = "identifier"
 # Key of the widget list in an overview template
 _WIDGETS_KEY = "widgets"
+# Widget fields (title, description, type, order, ...); widgets without
+# metadata hold them at the top level
+_METADATA_KEY = "metadata"
 # Key holding the position of a widget in its template
 _ORDER_KEY = "order"
 # content-hub's WidgetType.HTML, as number or name
 _HTML_WIDGET_TYPE = 3
 _HTML_WIDGET_TYPE_NAME = "html"
-# Widget data definition, JSON text in the API
-_DATA_JSON_KEY = "dataDefinitionJson"
-# Key of widget HTML in the data definition, same as content-hub
+# Widget configuration, an object or JSON text
+_CONFIG_KEY = "config"
+# Key of widget HTML in the configuration, same as content-hub
 _HTML_KEY = "htmlContent"
 # Widget file names are cut to stay below file system limits
 _MAX_WIDGET_NAME = 120
@@ -153,11 +157,16 @@ def _overview_templates(overviews: Any) -> list[dict]:
     return templates
 
 
+def _widget_fields(widget: dict) -> dict:
+    metadata = widget.get(_METADATA_KEY)
+    return metadata if isinstance(metadata, dict) else widget
+
+
 def _belongs_to(widget: dict, template: dict, templates: list[dict]) -> bool:
     """True when the widget holds the identifier of the template, or when the
     template is the only one."""
     template_id = template.get(_TEMPLATE_ID_KEY)
-    if isinstance(template_id, str) and template_id in widget.values():
+    if isinstance(template_id, str) and template_id in _widget_fields(widget).values():
         return True
     return len(templates) == 1
 
@@ -196,22 +205,23 @@ def _split_overviews(overviews: Any, files: dict[str, Any]) -> Any:
 def _split_widget(widget: dict, files: dict[str, Any]) -> None:
     """Moves a widget to widgets/<title>_<description>.json and, for an HTML
     widget, its HTML to the .html file of the same name."""
+    fields = _widget_fields(widget)
     base = widget_file_name(
-        _text(widget.get("title")) or _text(widget.get("name")),
-        _text(widget.get("description")),
+        _text(fields.get("title")) or _text(fields.get("name")),
+        _text(fields.get("description")),
     )
     path = _unique_path(files, f"{PLAYBOOK_WIDGETS_DIR}/{base}", ".json")
-    widget = dict(widget)
-    data_text = widget.get(_DATA_JSON_KEY)
-    data = _parse_json_object(data_text) if isinstance(data_text, str) else None
-    if (
-        _is_html_widget(widget)
-        and data is not None
-        and isinstance(data.get(_HTML_KEY), str)
-        and data[_HTML_KEY]
-    ):
-        files[_html_path(path)] = data.pop(_HTML_KEY)
-        widget[_DATA_JSON_KEY] = data
+    widget = copy.deepcopy(widget)
+    config = widget.get(_CONFIG_KEY)
+    # Config held as JSON text stays text, without the HTML
+    parsed = _parse_json_object(config) if isinstance(config, str) else config
+    if _is_html_widget(fields) and isinstance(parsed, dict):
+        html = parsed.get(_HTML_KEY)
+        if isinstance(html, str) and html:
+            files[_html_path(path)] = html
+            del parsed[_HTML_KEY]
+            if isinstance(config, str):
+                widget[_CONFIG_KEY] = json.dumps(parsed, ensure_ascii=False)
     files[path] = _sort_keys(widget)
 
 
@@ -247,26 +257,33 @@ def _join_widgets(overviews: Any, files: dict[str, Any], used: set[str]) -> Any:
 
 def _widget_order(widget: Any) -> tuple[int, float]:
     try:
-        return 0, float(widget.get(_ORDER_KEY))
+        return 0, float(_widget_fields(widget).get(_ORDER_KEY))
     except (AttributeError, TypeError, ValueError):
         return 1, 0.0
 
 
 def _join_widget(path: str, files: dict[str, Any]) -> Any:
-    """Reverses _split_widget: puts the HTML back into the data definition text."""
-    widget = copy.deepcopy(files[path])
-    if isinstance(widget, dict) and isinstance(widget.get(_DATA_JSON_KEY), dict):
-        data = widget[_DATA_JSON_KEY]
-        if _html_path(path) in files:
-            data[_HTML_KEY] = files[_html_path(path)]
-        widget[_DATA_JSON_KEY] = json.dumps(data, ensure_ascii=False)
+    """Reverses _split_widget: puts the HTML back into the widget config."""
+    # Widget files of earlier versions can hold markers
+    widget = _join_markers(files[path], files, set())
+    html = files.get(_html_path(path))
+    if not isinstance(widget, dict) or html is None:
+        return widget
+    config = widget.get(_CONFIG_KEY)
+    if isinstance(config, str) and (parsed := _parse_json_object(config)) is not None:
+        if _HTML_KEY not in parsed:
+            parsed[_HTML_KEY] = html
+            widget[_CONFIG_KEY] = json.dumps(parsed, ensure_ascii=False)
+    elif isinstance(config, dict) and _HTML_KEY not in config:
+        config[_HTML_KEY] = html
     return widget
 
 
-def _is_html_widget(widget: dict) -> bool:
-    widget_type = widget.get("type")
+def _is_html_widget(fields: dict) -> bool:
+    widget_type = fields.get("type")
     if isinstance(widget_type, str):
-        return widget_type.casefold() == _HTML_WIDGET_TYPE_NAME
+        name = widget_type.casefold()
+        return name == _HTML_WIDGET_TYPE_NAME or name.endswith(f"_{_HTML_WIDGET_TYPE_NAME}")
     return widget_type == _HTML_WIDGET_TYPE and not isinstance(widget_type, bool)
 
 
