@@ -19,12 +19,14 @@
         trigger.json
         overviews.json
         steps/<instance_name>_<identifier[:5]>.json
-        widgets/<widget_title>_<identifier[:5]>.html
+        widgets/<widget_title>_<widget_description>.html
 
 Widgets hold JSON and HTML as text. In overviews.json, JSON text is stored
-parsed with sorted keys as {"$json": ...} and HTML is moved to its own file,
-referenced as {"$file": ...}. The files then only change when the content
-does, not when the API formats the text differently.
+parsed with sorted keys as {"$json": ...} (nested for JSON text that was
+encoded twice) and HTML is moved to its own file, referenced as
+{"$file": ...}. The HTML file holds the original HTML with its real line
+breaks. The files then only change when the content does, not when the API
+formats the text differently.
 """
 
 from __future__ import annotations
@@ -55,6 +57,11 @@ _JSON_MARKER = "$json"
 _FILE_MARKER = "$file"
 # Key of widget HTML, same as content-hub's widget data definition
 _HTML_KEY = "htmlContent"
+# Other text is also moved to an HTML file when it is an HTML document or element
+_HTML_TEXT = re.compile(r"\s*<(!doctype\s+html|html|[a-z][\w-]*)[\s>/].*>\s*", re.I | re.S)
+_LABEL_KEYS = {"title", "name", "description"}
+# Widget file names are cut to stay below file system limits
+_MAX_WIDGET_NAME = 120
 
 
 def to_snake_case(s: str) -> str:
@@ -72,6 +79,16 @@ def step_file_name(instance_name: str | None, identifier: str | None) -> str:
     """Same naming as content-hub's mp tool: <instance_name>_<identifier[:5]>."""
     sanitized = re.sub(r'[<>:"/\\|?*]', "", (instance_name or "").replace(" ", "_"))
     return f"{sanitized}_{(identifier or '')[:5]}".lower()
+
+
+def widget_file_name(title: str | None, description: str | None) -> str:
+    """Widget HTML file name: <title>_<description>, without unsafe characters."""
+    parts = [
+        re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", (part or "").strip()).replace(" ", "_")
+        for part in (title, description)
+    ]
+    name = "_".join(part for part in parts if part)[:_MAX_WIDGET_NAME].strip("._")
+    return name.lower() or "widget"
 
 
 def to_files(raw_data: dict) -> dict[str, Any]:
@@ -123,11 +140,15 @@ def _split_text(value: Any, files: dict[str, Any], file_base: str) -> Any:
     if not isinstance(value, dict):
         return value
 
-    if isinstance(value.get("title"), str):
-        file_base = step_file_name(value["title"], value.get("identifier"))
+    title = value.get("title") if isinstance(value.get("title"), str) else value.get("name")
+    if isinstance(title, str):
+        description = value.get("description")
+        file_base = widget_file_name(
+            title, description if isinstance(description, str) else None
+        )
     result = {}
     for key, item in value.items():
-        if key == _HTML_KEY and isinstance(item, str) and item:
+        if isinstance(item, str) and item and (key == _HTML_KEY or _is_html_text(key, item)):
             path = _unique_path(files, f"{PLAYBOOK_WIDGETS_DIR}/{file_base}", ".html")
             files[path] = item
             result[key] = {_FILE_MARKER: path}
@@ -138,14 +159,32 @@ def _split_text(value: Any, files: dict[str, Any], file_base: str) -> Any:
     return result
 
 
-def _parse_json_object(text: str) -> dict | None:
-    if not text.lstrip().startswith("{"):
+def _is_html_text(key: str, text: str) -> bool:
+    """True for HTML held under another key, but not for short labels like titles."""
+    return (
+        key not in _LABEL_KEYS
+        and ("\n" in text or len(text) >= 200)
+        and _HTML_TEXT.fullmatch(text) is not None
+    )
+
+
+def _parse_json_object(text: str) -> Any:
+    """Parses JSON object text, also when it was encoded twice.
+
+    Returns:
+        The parsed object, {"$json": object} for twice encoded text, or None.
+    """
+    if not text.lstrip().startswith(("{", '"')):
         return None
     try:
         parsed = json.loads(text)
     except ValueError:
         return None
-    return parsed if isinstance(parsed, dict) else None
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, str) and (inner := _parse_json_object(parsed)) is not None:
+        return {_JSON_MARKER: inner}
+    return None
 
 
 def _sort_keys(value: Any) -> Any:
