@@ -15,15 +15,16 @@
 
 import logging
 import os
+import shutil
 import sys
 
 import click
-from config import EXCLUDE_FOLDER, INCLUDE_BLOCKS
+from config import EXCLUDE_FOLDER, INCLUDE_BLOCKS, PLAYBOOKS_PATH
 from constants import PLAYBOOKS_ROOT_README
 from jinja2 import Template
 from manager import ResponseManager
 from models import SocRole, Workflow, WorkflowMenuCard
-from utils import get_local_playbooks
+from utils import WD, get_local_playbooks
 
 LOGGER = logging.getLogger("rac")
 
@@ -106,6 +107,12 @@ def pull_playbooks():
 
     try:
         installed_playbooks: list[WorkflowMenuCard] = response_manager.get_playbooks()
+
+        # The repo mirrors the instance, so start from an empty playbooks folder.
+        # Renamed, moved and deleted playbooks then don't leave old files behind.
+        playbooks_dir = os.path.join(WD, PLAYBOOKS_PATH)
+        if os.path.isdir(playbooks_dir):
+            shutil.rmtree(playbooks_dir)
 
         for playbook in installed_playbooks:
             if EXCLUDE_FOLDER and EXCLUDE_FOLDER in playbook.categoryName:

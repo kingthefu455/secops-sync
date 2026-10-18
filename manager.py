@@ -99,7 +99,9 @@ class ResponseManager:
         # Remove duplicates and split by type
         workflows = list(set(workflows))
         cache: Cache[str, int] = Cache()
-        playbook_installer = WorkflowInstaller(self.client, cache)
+        playbook_installer = WorkflowInstaller(
+            self.client, cache, {workflow.name for workflow in workflows}
+        )
         blocks, playbooks = [], []
         for workflow in workflows:
             if workflow.type == WorkflowTypes.BLOCK:
@@ -276,9 +278,11 @@ class WorkflowInstaller:
         self,
         client: SecOpsClient,
         mod_time_cache: Cache[str, int],
+        git_workflow_names: set[str] | None = None,
     ) -> None:
         self.client = client
         self._mod_time_cache: Cache[str, int] = mod_time_cache
+        self._git_workflow_names: set[str] = git_workflow_names or set()
         self._cache: dict[str, WorkflowMenuCard] = {}
 
     def install_workflow(self, workflow: Workflow) -> None:
@@ -288,56 +292,102 @@ class WorkflowInstaller:
             workflow: A Playbook object to install
 
         """
-        if self._workflow_exists(workflow.name):
-            self._update_workflow_if_needed(workflow)
+        installed_workflow = self._find_installed_workflow(workflow)
+        if installed_workflow:
+            self._update_workflow_if_needed(workflow, installed_workflow)
 
         else:
             self.install_new_workflow(workflow)
 
-    def _workflow_exists(self, __workflow_name: str, /) -> bool:
-        """Check if a workflow exists (is installed) in the platform."""
-        return __workflow_name in self._installed_playbooks
+    def _find_installed_workflow(self, workflow: Workflow) -> WorkflowMenuCard | None:
+        """Find the installed workflow that a git workflow belongs to.
 
-    def _update_workflow_if_needed(self, workflow: Workflow) -> None:
-        if not self._workflow_was_modified(workflow):
+        A workflow renamed in git keeps its identifier, so it is matched by
+        identifier as long as its old name is gone from git. Otherwise (a copied
+        workflow folder, or a migration between instances) it is matched by name.
+
+        Raises:
+            ValueError: If a renamed workflow takes the name of another installed
+                workflow.
+        """
+        identifier = workflow.raw_data.get("identifier")
+        installed = next(
+            (
+                x
+                for x in self._installed_playbooks.values()
+                if identifier and x.identifier == identifier
+            ),
+            None,
+        )
+        if (
+            installed is None
+            or installed.name == workflow.name
+            # The old name is still in git, so this workflow is a copy
+            or installed.name in self._git_workflow_names
+        ):
+            return self._installed_playbooks.get(workflow.name)
+
+        if workflow.name in self._installed_playbooks:
+            raise ValueError(
+                f"Can't rename workflow '{installed.name}' to '{workflow.name}': "
+                "another installed workflow already has that name"
+            )
+        LOGGER.info(f"Workflow '{installed.name}' was renamed to '{workflow.name}'")
+        return installed
+
+    def _update_workflow_if_needed(
+        self, workflow: Workflow, installed_workflow: WorkflowMenuCard
+    ) -> None:
+        if not self._workflow_was_modified(workflow, installed_workflow):
             LOGGER.info(f"Skipped update for unchanged workflow '{workflow.name}'")
             self._filter_and_save_context()
             return
 
-        self._log_merge_conflicts(workflow)
-        self.update_local_workflow(workflow)
+        self._log_merge_conflicts(workflow, installed_workflow)
+        self.update_local_workflow(workflow, installed_workflow)
 
-    def _log_merge_conflicts(self, workflow: Workflow) -> None:
-        if self._has_merge_conflicts(workflow):
+    def _log_merge_conflicts(
+        self, workflow: Workflow, installed_workflow: WorkflowMenuCard
+    ) -> None:
+        if self._has_merge_conflicts(workflow, installed_workflow):
             LOGGER.warning(
                 "Both the git playbook and local installed playbook were modified."
                 "  Git version will override local changes!",
             )
 
-    def _has_merge_conflicts(self, workflow: Workflow) -> bool:
-        cached_time: int = self._mod_time_cache.get(workflow.name, -1)
-        local_time: int = self._get_local_workflow_mod_time(workflow.name, -1)
+    def _has_merge_conflicts(
+        self, workflow: Workflow, installed_workflow: WorkflowMenuCard
+    ) -> bool:
+        cached_time: int = self._mod_time_cache.get(installed_workflow.name, -1)
+        local_time: int = self._get_local_workflow_mod_time(
+            installed_workflow.name, -1
+        )
         return min(local_time, workflow.modification_time) > cached_time
 
-    def _workflow_was_modified(self, workflow: Workflow) -> bool:
-        cached_time: int = self._mod_time_cache.get(workflow.name, -1)
+    def _workflow_was_modified(
+        self, workflow: Workflow, installed_workflow: WorkflowMenuCard
+    ) -> bool:
+        cached_time: int = self._mod_time_cache.get(installed_workflow.name, -1)
         return workflow.modification_time > cached_time
 
-    def update_local_workflow(self, workflow: Workflow) -> None:
+    def update_local_workflow(
+        self, workflow: Workflow, installed_workflow: WorkflowMenuCard
+    ) -> None:
         """Update an existing workflow in the platform."""
         LOGGER.info(f"Updating existing workflow '{workflow.name}'")
-        self._adjust_workflow_ids(workflow)
+        self._adjust_workflow_ids(workflow, installed_workflow)
         self._process_steps(workflow)
         self.client.save_playbook(workflow)
         self._save_workflow_mod_time_to_context(workflow)
         LOGGER.info(f"Workflow '{workflow.name}' was updated successfully")
 
-    def _adjust_workflow_ids(self, workflow: Workflow) -> None:
-        """Adjust workflow identifiers to match the existing workflow's
-        (with the same name) identifiers.
-        """
-        playbook_id: str = self._installed_playbooks[workflow.name].identifier
-        local_playbook: dict[str, Any] = self.client.get_playbook(playbook_id)
+    def _adjust_workflow_ids(
+        self, workflow: Workflow, installed_workflow: WorkflowMenuCard
+    ) -> None:
+        """Adjust workflow identifiers to match the installed workflow's identifiers."""
+        local_playbook: dict[str, Any] = self.client.get_playbook(
+            installed_workflow.identifier
+        )
         self._copy_ids_from_existing_workflow(workflow, local_playbook)
         self._process_steps(workflow, local_playbook)
 

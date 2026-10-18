@@ -162,7 +162,8 @@ class Workflow(Content):
     def iter_files(self) -> Iterator[File]:
         """Yields the playbook files in the content-hub layout and the README."""
         for path, data in playbook_format.to_files(self.raw_data).items():
-            yield File(path, json.dumps(data, indent=4))
+            # Widget HTML is stored as is
+            yield File(path, data if isinstance(data, str) else json.dumps(data, indent=4))
         yield File("README.md", self.readme)
 
     @property
