@@ -41,6 +41,55 @@ def create_root_readme() -> str:
     return readme.render(playbooks=playbooks)
 
 
+def get_soc_role_ids(soc_roles: list[SocRole]) -> dict[str, int | str]:
+    """Maps SOC role display names to role IDs, the last part of the role resource
+    name (projects/.../socRoles/{id}).
+    """
+    role_ids = {}
+    for soc_role in soc_roles:
+        role_id = soc_role.name.rsplit("/", 1)[-1]
+        role_ids[soc_role.displayName] = int(role_id) if role_id.isdigit() else role_id
+    return role_ids
+
+
+def add_overview_role_names(
+    workflow: Workflow, role_ids: dict[str, int | str]
+) -> None:
+    """Adds the role names to overview templates that only hold role IDs.
+
+    Role IDs differ between instances, so the sync maps the names instead.
+    """
+    # Compared as text, in case the API returns IDs as strings
+    names_by_id = {str(role_id): name for name, role_id in role_ids.items()}
+    for template in workflow.overview_templates:
+        if "roleNames" not in template:
+            template["roleNames"] = [
+                names_by_id[str(role)]
+                for role in template.get("roles", [])
+                if str(role) in names_by_id
+            ]
+
+
+def remap_overview_roles(
+    workflow: Workflow, role_ids: dict[str, int | str]
+) -> None:
+    """Sets the overview template roles to the IDs of their role names on this
+    instance, same as GitSync. Roles that don't exist here are removed.
+    """
+    for template in workflow.overview_templates:
+        role_names = template.pop("roleNames", None)
+        if not role_names:
+            continue
+
+        missing = [name for name in role_names if name not in role_ids]
+        if missing:
+            LOGGER.warning(
+                f"Role(s) {', '.join(missing)} of view '{template.get('name')}' in "
+                f"playbook '{workflow.name}' don't exist on this instance and are removed"
+            )
+        template["roles"] = [role_ids[name] for name in role_names if name in role_ids]
+
+
 @click.group()
 def cli():
     """Manages Response As Code."""
@@ -49,7 +98,7 @@ def cli():
 @cli.command(name="sync-playbooks")
 def sync_playbooks():
     response_manager = ResponseManager()
-    soc_roles: list[SocRole] = response_manager.get_soc_roles()
+    role_ids = get_soc_role_ids(response_manager.get_soc_roles())
 
     try:
         playbooks = {}
@@ -59,18 +108,7 @@ def sync_playbooks():
         for playbook in git_playbooks:
             LOGGER.info(f"Playbook {playbook.name}")
 
-            overview_templates = playbook.overview_templates
-            new_templates = []
-            for overview_template in overview_templates:
-                LOGGER.info(f"Roles: {overview_template['roles']}")
-                new_roles = []
-                for role in overview_template["roles"]:
-                    for soc_role in soc_roles:
-                        if soc_role["name"] == role:
-                            new_roles.append(soc_role["id"])
-                overview_template["roles"] = new_roles
-                new_templates.append(overview_template)
-            playbook.overview_templates = new_templates
+            remap_overview_roles(playbook, role_ids)
             LOGGER.info(
                 f"Playbook Updated Overview templates: {playbook.overview_templates}"
             )
@@ -103,7 +141,7 @@ def pull_playbooks():
 
     response_manager = ResponseManager()
 
-    soc_roles: list[SocRole] = response_manager.get_soc_roles()
+    role_ids = get_soc_role_ids(response_manager.get_soc_roles())
 
     try:
         installed_playbooks: list[WorkflowMenuCard] = response_manager.get_playbooks()
@@ -126,18 +164,7 @@ def pull_playbooks():
                 response_manager.get_playbook(playbook.identifier)
             )
             LOGGER.info(f"Playbook details: {playbook_details}")
-            overview_templates = playbook_details.overview_templates
-            new_templates = []
-            for overview_template in overview_templates:
-                LOGGER.info(f"Roles: {overview_template.get('roles')}")
-                new_roles = []
-                for role in overview_template.get("roles", []):
-                    for soc_role in soc_roles:
-                        if soc_role.displayName == role:
-                            new_roles.append(soc_role.name)
-                overview_template["roles"] = new_roles
-                new_templates.append(overview_template)
-            playbook_details.overview_templates = new_templates
+            add_overview_role_names(playbook_details, role_ids)
 
             response_manager.update_instance_name_in_steps(playbook_details)
 
