@@ -92,11 +92,12 @@ def _read_playbook_dir(playbook_dir: str) -> Workflow:
     widgets_dir = os.path.join(playbook_dir, PLAYBOOK_WIDGETS_DIR)
     if os.path.isdir(widgets_dir):
         for file_name in os.listdir(widgets_dir):
-            if file_name.endswith(".html"):
+            file_path = os.path.join(widgets_dir, file_name)
+            if file_name.endswith(".json"):
+                files[f"{PLAYBOOK_WIDGETS_DIR}/{file_name}"] = _read_json(file_path)
+            elif file_name.endswith(".html"):
                 # newline="" keeps the line endings of the HTML as they are
-                with open(
-                    os.path.join(widgets_dir, file_name), encoding="utf-8", newline=""
-                ) as f:
+                with open(file_path, encoding="utf-8", newline="") as f:
                     files[f"{PLAYBOOK_WIDGETS_DIR}/{file_name}"] = f.read()
     return Workflow(playbook_format.from_files(files))
 

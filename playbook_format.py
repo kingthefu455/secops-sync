@@ -19,14 +19,18 @@
         trigger.json
         overviews.json
         steps/<instance_name>_<identifier[:5]>.json
+        widgets/<widget_title>_<widget_description>.json
         widgets/<widget_title>_<widget_description>.html
 
-Widgets hold JSON and HTML as text. In overviews.json, JSON text is stored
-parsed with sorted keys as {"$json": ...} (nested for JSON text that was
-encoded twice) and HTML is moved to its own file, referenced as
-{"$file": ...}. The HTML file holds the original HTML with its real line
-breaks. The files then only change when the content does, not when the API
-formats the text differently.
+Every widget of the overview templates is moved to its own JSON file, and the
+HTML of the widget to an HTML file next to it. overviews.json then only holds
+the templates with references to the widget files, as {"$file": ...}.
+
+Overview and widget files have sorted keys. Widgets hold JSON and HTML as
+text: JSON text is stored parsed as {"$json": ...} (nested for JSON text that
+was encoded twice) and HTML text is moved to the HTML file, which holds the
+original HTML with its real line breaks. The files then only change when the
+content does, not when the API orders or formats the data differently.
 """
 
 from __future__ import annotations
@@ -55,10 +59,14 @@ _SEPARATE_FILES = {
 # Markers in overviews.json for text the API holds as a string
 _JSON_MARKER = "$json"
 _FILE_MARKER = "$file"
+# Key of the widget list in an overview template
+_WIDGETS_KEY = "widgets"
+# Key holding the position of a widget in its template
+_ORDER_KEY = "order"
 # Key of widget HTML, same as content-hub's widget data definition
 _HTML_KEY = "htmlContent"
-# Other text is also moved to an HTML file when it is an HTML document or element
-_HTML_TEXT = re.compile(r"\s*<(!doctype\s+html|html|[a-z][\w-]*)[\s>/].*>\s*", re.I | re.S)
+# Other text is also moved to an HTML file when it contains HTML tags
+_HTML_TAG = re.compile(r"<(!doctype\s|/?[a-z][\w-]*[\s>/])", re.I)
 _LABEL_KEYS = {"title", "name", "description"}
 # Widget file names are cut to stay below file system limits
 _MAX_WIDGET_NAME = 120
@@ -110,8 +118,8 @@ def to_files(raw_data: dict) -> dict[str, Any]:
         files[_unique_path(files, f"{PLAYBOOK_STEPS_DIR}/{base}", ".json")] = step
 
     if PLAYBOOK_OVERVIEWS_FILE in files:
-        files[PLAYBOOK_OVERVIEWS_FILE] = _split_text(
-            files[PLAYBOOK_OVERVIEWS_FILE], files, "widget"
+        files[PLAYBOOK_OVERVIEWS_FILE] = _split_overviews(
+            _sort_keys(files[PLAYBOOK_OVERVIEWS_FILE]), files
         )
     return files
 
@@ -124,13 +132,69 @@ def _unique_path(files: dict[str, Any], base: str, extension: str) -> str:
     return path
 
 
-def _split_text(value: Any, files: dict[str, Any], file_base: str) -> Any:
-    """Parses JSON text and moves HTML text to widget files.
+def _split_overviews(value: Any, files: dict[str, Any]) -> Any:
+    """Moves every widget of the overview templates to its own files.
 
     Args:
         value: Overview templates data to convert.
+        files: Playbook files, widget JSON and HTML files are added to it.
+
+    Returns:
+        A converted copy of value, with references in place of the widgets.
+    """
+    if isinstance(value, list):
+        return [_split_overviews(x, files) for x in value]
+    if not isinstance(value, dict):
+        return value
+
+    result = {}
+    for key, item in value.items():
+        if key == _WIDGETS_KEY and isinstance(item, list):
+            # Widgets with the same title and description get numbered file
+            # names. Naming them in an order from their content keeps the
+            # numbers stable when the API returns the widgets in another order.
+            refs: list[Any] = [None] * len(item)
+            for i in sorted(range(len(item)), key=lambda i: json.dumps(item[i], sort_keys=True)):
+                refs[i] = _split_widget(item[i], files)
+            # With an order field in every widget, the list order carries no
+            # information, so sort it to keep overviews.json stable.
+            if all(isinstance(w, dict) and _ORDER_KEY in w for w in item):
+                refs.sort(key=lambda ref: ref[_FILE_MARKER])
+            result[key] = refs
+        elif isinstance(item, str):
+            # Text outside widgets is handled like widget text
+            base = f"{PLAYBOOK_WIDGETS_DIR}/overview"
+            result[key] = _split_text({key: item}, files, base)[key]
+        else:
+            result[key] = _split_overviews(item, files)
+    return result
+
+
+def _split_widget(widget: Any, files: dict[str, Any]) -> Any:
+    """Moves a widget to widgets/<title>_<description>.json and its HTML next to it."""
+    if not isinstance(widget, dict):
+        return widget
+    base = widget_file_name(
+        _text(widget.get("title")) or _text(widget.get("name")),
+        _text(widget.get("description")),
+    )
+    path = _unique_path(files, f"{PLAYBOOK_WIDGETS_DIR}/{base}", ".json")
+    files[path] = None  # reserves the path before the HTML file is named
+    files[path] = _split_text(widget, files, path.removesuffix(".json"))
+    return {_FILE_MARKER: path}
+
+
+def _text(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _split_text(value: Any, files: dict[str, Any], file_base: str) -> Any:
+    """Parses JSON text and moves HTML text to widget HTML files.
+
+    Args:
+        value: Widget data to convert.
         files: Playbook files, widget HTML files are added to it.
-        file_base: Base name for HTML files, from the closest widget.
+        file_base: Path of the widget file without extension, used for HTML files.
 
     Returns:
         A converted copy of value.
@@ -140,16 +204,10 @@ def _split_text(value: Any, files: dict[str, Any], file_base: str) -> Any:
     if not isinstance(value, dict):
         return value
 
-    title = value.get("title") if isinstance(value.get("title"), str) else value.get("name")
-    if isinstance(title, str):
-        description = value.get("description")
-        file_base = widget_file_name(
-            title, description if isinstance(description, str) else None
-        )
     result = {}
     for key, item in value.items():
         if isinstance(item, str) and item and (key == _HTML_KEY or _is_html_text(key, item)):
-            path = _unique_path(files, f"{PLAYBOOK_WIDGETS_DIR}/{file_base}", ".html")
+            path = _unique_path(files, file_base, ".html")
             files[path] = item
             result[key] = {_FILE_MARKER: path}
         elif isinstance(item, str) and (parsed := _parse_json_object(item)) is not None:
@@ -164,7 +222,7 @@ def _is_html_text(key: str, text: str) -> bool:
     return (
         key not in _LABEL_KEYS
         and ("\n" in text or len(text) >= 200)
-        and _HTML_TEXT.fullmatch(text) is not None
+        and _HTML_TAG.search(text) is not None
     )
 
 
@@ -196,7 +254,8 @@ def _sort_keys(value: Any) -> Any:
 
 
 def _join_text(value: Any, files: dict[str, Any]) -> Any:
-    """Reverses _split_text: turns markers back into the text the API expects."""
+    """Reverses _split_overviews: puts widgets back and turns markers back into
+    the text the API expects."""
     if isinstance(value, list):
         return [_join_text(x, files) for x in value]
     if not isinstance(value, dict):
@@ -204,7 +263,8 @@ def _join_text(value: Any, files: dict[str, Any]) -> Any:
     if value.keys() == {_JSON_MARKER}:
         return json.dumps(_join_text(value[_JSON_MARKER], files), ensure_ascii=False)
     if value.keys() == {_FILE_MARKER}:
-        return files[value[_FILE_MARKER]]
+        # A widget JSON file, or the text of a widget HTML file
+        return _join_text(files[value[_FILE_MARKER]], files)
     return {k: _join_text(v, files) for k, v in value.items()}
 
 
