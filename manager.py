@@ -319,12 +319,23 @@ class WorkflowInstaller:
             ),
             None,
         )
+        if installed is None:
+            if workflow.name not in self._installed_playbooks:
+                LOGGER.info(
+                    f"No installed workflow has the name or identifier '{identifier}' "
+                    f"of workflow '{workflow.name}'"
+                )
+            return self._installed_playbooks.get(workflow.name)
         if (
-            installed is None
-            or installed.name == workflow.name
+            installed.name == workflow.name
             # The old name is still in git, so this workflow is a copy
             or installed.name in self._git_workflow_names
         ):
+            if installed.name != workflow.name:
+                LOGGER.info(
+                    f"Workflow '{workflow.name}' has the identifier of installed "
+                    f"workflow '{installed.name}', which is still in git, so it's a copy"
+                )
             return self._installed_playbooks.get(workflow.name)
 
         if workflow.name in self._installed_playbooks:
