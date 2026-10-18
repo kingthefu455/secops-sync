@@ -32,8 +32,8 @@ SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 # Filesystem paths and filenames
 PLAYBOOKS_PATH = "Playbooks"
 # Each playbook is stored in its own folder using the content-hub layout, with
-# every step in a separate file inside PLAYBOOK_STEPS_DIR and the HTML of every
-# widget in a separate file inside PLAYBOOK_WIDGETS_DIR.
+# every step in a separate file inside PLAYBOOK_STEPS_DIR and every overview
+# widget in a JSON file and an HTML file inside PLAYBOOK_WIDGETS_DIR.
 PLAYBOOK_DEFINITION_FILE = "definition.json"
 PLAYBOOK_TRIGGER_FILE = "trigger.json"
 PLAYBOOK_OVERVIEWS_FILE = "overviews.json"
