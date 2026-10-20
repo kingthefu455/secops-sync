@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # The report compares the pull request with the history of its base branch
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
@@ -21,6 +24,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        id: install
         run: pip install -r requirements.txt ruff==0.17.1
 
       - name: Check Python code for syntax errors and undefined names
@@ -34,3 +38,11 @@ jobs:
 
       - name: Validate playbooks
         run: python main.py validate-playbooks
+
+      # Shown on the summary page of the run. Also runs when a check above
+      # failed, since the report helps to fix it.
+      - name: Report the changes and findings of the pull request
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        # An explicit bash adds pipefail, so a failing report fails the step
+        shell: bash
+        run: python validation_report.py --base "origin/$GITHUB_BASE_REF" | tee -a "$GITHUB_STEP_SUMMARY"
