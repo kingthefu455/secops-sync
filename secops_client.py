@@ -348,6 +348,18 @@ class SecOpsClient:
             ) from e
         return integration_instances
 
+    def get_default_integration_instance(self, integration_name: str) -> dict[str, Any]:
+        """Retrieves the default instance of an integration from the Chronicle API."""
+        try:
+            parent = f"projects/{self.project_id}/locations/{self.region}/instances/{self.customer_id}"
+            api_path = f"/v1alpha/{parent}/integrations/{integration_name}/integrationInstances:fetchDefaultInstance"
+
+            return self._make_request(method="GET", path=api_path)
+        except Exception as e:
+            raise APIError(
+                f"Failed to retrieve default instance of integration {integration_name}: {e}"
+            ) from e
+
     def get_integrations_instances(self, environment: str) -> list[dict[str, Any]]:
         integration_instances: list[dict[str, Any]] = []
         try:

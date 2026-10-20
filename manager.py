@@ -32,7 +32,8 @@ LOGGER = logging.getLogger("rac")
 
 # Step parameters holding an integration instance id, and the parameter keys that
 # store the instance display name on pull. Instance ids are unique per platform,
-# so the display name is used to find the same instance in the target platform.
+# so the display name is used to find the same instance in the target platform,
+# and the default instance of the integration is used for steps without one.
 INSTANCE_DISPLAY_NAME_KEYS = {
     "IntegrationInstance": "InstanceDisplayName",
     "FallbackIntegrationInstance": "FallbackInstanceDisplayName",
@@ -561,11 +562,11 @@ class WorkflowInstaller:
     ) -> None:
         """Reconfigure an integration instance of a workflow step.
 
-        If the step has the display names of its integration instances (stored on pull), it will
-        first assign the step to the instances with the same display names in this platform, since
-        instance ids are different in every platform.
-        Otherwise, if old_steps is supplied, It will try to match the same step in the old playbook
-        and assign the step to the same integration instance.
+        Since instance ids are different in every platform, it will first assign the step to the
+        instances with the display names stored on pull, or to the default instance of the
+        integration if the step has no display name or no instance has that name.
+        If that isn't possible and old_steps is supplied, It will try to match the same step in the
+        old playbook and assign the step to the same integration instance.
         Otherwise, If the playbook is assigned to only one environment (and not all environments),
         it will assign the first integration instance it finds.
         If the playbook is assigned to All Environments or more than one environment, The step will
@@ -579,7 +580,7 @@ class WorkflowInstaller:
             from it instead
 
         """
-        if self._assign_integration_instances_by_display_name(step, environments):
+        if self._assign_target_integration_instances(step, environments):
             return
 
         if existing_step:
@@ -673,13 +674,17 @@ class WorkflowInstaller:
             elif param.get("FallbackInstanceDisplayName"):
                 del param["FallbackInstanceDisplayName"]
 
-    def _assign_integration_instances_by_display_name(
+    def _assign_target_integration_instances(
         self,
         step: dict,
         environments: list,
     ) -> bool:
-        """Assign the step to the integration instances of this platform with the same display
-        names as the instances of the platform the step was pulled from.
+        """Assign the step to integration instances of this platform.
+
+        An instance is matched by the display name stored on pull. If the step has no display
+        name (only the instance id of the platform it was pulled from), or no instance has that
+        name, the default instance of the integration is used. Steps in dynamic mode keep the
+        AutomaticEnvironment instance.
 
         Args:
             step: The step to reconfigure
@@ -687,43 +692,48 @@ class WorkflowInstaller:
             same display name
 
         Returns:
-            True if the step has instance display names and all of them were found, False
-            otherwise (the step isn't changed)
+            True if instances were assigned, False if the step has no instance to assign or the
+            integration has no default instance when one is needed (the step isn't changed)
 
         """
-        named_params = [
-            (param, param[key])
-            for param in step.get("parameters", [])
-            if (key := INSTANCE_DISPLAY_NAME_KEYS.get(param.get("name")))
-            and param.get(key)
-        ]
-        if not named_params:
-            return False
+        integration_name = step.get("integration")
+        instance_ids = []
+        for param in step.get("parameters", []):
+            display_name_key = INSTANCE_DISPLAY_NAME_KEYS.get(param.get("name"))
+            if not display_name_key:
+                continue
 
-        instance_ids = [
-            self._find_integration_instance_id(
-                step.get("integration"),
-                display_name,
-                environments,
-            )
-            for _, display_name in named_params
-        ]
-        missing = [
-            display_name
-            for (_, display_name), instance_id in zip(named_params, instance_ids)
-            if not instance_id
-        ]
-        if missing:
-            LOGGER.warning(
-                f"Integration instance(s) {', '.join(missing)} of integration "
-                f"'{step.get('integration')}' used by step '{step.get('instanceName')}' "
-                "weren't found, assigning the step to another instance"
-            )
-            return False
+            display_name = param.get(display_name_key)
+            if display_name:
+                instance_id = self._find_integration_instance_id(
+                    integration_name,
+                    display_name,
+                    environments,
+                )
+                if instance_id:
+                    instance_ids.append((param, instance_id))
+                    continue
+                LOGGER.warning(
+                    f"Integration instance '{display_name}' of integration '{integration_name}' "
+                    f"used by step '{step.get('instanceName')}' wasn't found, "
+                    "using the default instance"
+                )
+            elif param.get("value") in (None, "", "AutomaticEnvironment"):
+                # No instance, or dynamic mode
+                continue
 
-        for (param, _), instance_id in zip(named_params, instance_ids):
+            instance_id = self._get_default_integration_instance_id(integration_name)
+            if not instance_id:
+                LOGGER.warning(
+                    f"Integration '{integration_name}' used by step '{step.get('instanceName')}' "
+                    "has no default instance, assigning the step to another instance"
+                )
+                return False
+            instance_ids.append((param, instance_id))
+
+        for param, instance_id in instance_ids:
             param["value"] = instance_id
-        return True
+        return bool(instance_ids)
 
     def _find_integration_instance_id(
         self,
@@ -758,8 +768,27 @@ class WorkflowInstaller:
                 f"Found {len(instances)} instances of integration '{integration_name}' "
                 f"named '{display_name}', using the first one"
             )
-        # The instance id is the last part of the resource name
-        return instances[0].get("name", "").rsplit("/", 1)[-1] or None
+        return self._get_instance_id(instances[0])
+
+    def _get_default_integration_instance_id(self, integration_name: str) -> str | None:
+        """Get the id of the default instance of an integration, None if it has none"""
+        cache_key = f"default_instance_of_integration_{integration_name}"
+        if cache_key not in self._cache:
+            try:
+                instance = self.client.get_default_integration_instance(
+                    integration_name
+                )
+            except APIError as e:
+                if not _is_not_found(e):
+                    raise
+                instance = {}
+            self._cache[cache_key] = self._get_instance_id(instance)
+        return self._cache.get(cache_key)
+
+    @staticmethod
+    def _get_instance_id(instance: dict) -> str | None:
+        """The instance id is the last part of the instance resource name"""
+        return (instance.get("name") or "").rsplit("/", 1)[-1] or None
 
     def _get_integration_instances(self, integration_name: str) -> list[dict]:
         """Get all the instances of an integration, empty if the integration isn't installed"""
