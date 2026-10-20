@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import uuid
 from typing import Any
 
@@ -30,6 +29,23 @@ from secops_client import SecOpsClient
 from utils import WD, push_playbook, update_objects
 
 LOGGER = logging.getLogger("rac")
+
+# Step parameters holding an integration instance id, and the parameter keys that
+# store the instance display name on pull. Instance ids are unique per platform,
+# so the display name is used to find the same instance in the target platform.
+INSTANCE_DISPLAY_NAME_KEYS = {
+    "IntegrationInstance": "InstanceDisplayName",
+    "FallbackIntegrationInstance": "FallbackInstanceDisplayName",
+}
+
+
+def _is_not_found(error: BaseException | None) -> bool:
+    """Checks if an API error was caused by a 404 response."""
+    while error is not None:
+        if isinstance(error, HTTPError) and error.response is not None:
+            return error.response.status_code == 404
+        error = error.__cause__
+    return False
 
 
 class ResponseManager:
@@ -217,7 +233,7 @@ class ResponseManager:
         workflow: Workflow,
     ) -> None:
         """Updates name of instances in the steps."""
-        for step in workflow.steps:
+        for step in WorkflowInstaller._flatten_playbook_steps(workflow.steps):
             if (
                 step.get("type") == STEP_TYPE
                 and step.get("actionProvider") == "Scripts"
@@ -238,6 +254,8 @@ class ResponseManager:
         for param in step.get("parameters", []):
             param_name = param.get("name")
             param_value = param.get("value")
+            for key in INSTANCE_DISPLAY_NAME_KEYS.values():
+                param.pop(key, None)
             try:
                 if not workflow._is_integration_instance_param(param_name, param_value):
                     continue
@@ -251,24 +269,10 @@ class ResponseManager:
                         param["InstanceDisplayName"] = display_name
                     case "FallbackIntegrationInstance":
                         param["FallbackInstanceDisplayName"] = display_name
-            except HTTPError as e:
+            except APIError as e:
                 # ignoring 404 errors as they expected in migrations between instances.
-                if e.response is not None and hasattr(e.response, "status_code"):
-                    status_code = e.response.status_code
-                    if status_code != 404:
-                        raise
-                else:
-                    # TIPCommon is re-raising HTTPError without response object
-                    # Try to extract status code from the error message itself
-                    error_msg = str(e)
-                    status_code_match = re.search(r"(\d{3})\s+Client Error", error_msg)
-                    if status_code_match:
-                        status_code = int(status_code_match.group(1))
-                        if status_code != 404:
-                            raise
-                    else:
-                        # can't determine the status code
-                        raise
+                if not _is_not_found(e):
+                    raise
 
 
 class WorkflowInstaller:
@@ -377,6 +381,7 @@ class WorkflowInstaller:
         LOGGER.info(f"Updating existing workflow '{workflow.name}'")
         self._adjust_workflow_ids(workflow, installed_workflow)
         self._process_steps(workflow)
+        self._remove_instance_display_names(workflow)
         self.client.save_playbook(workflow)
         self._save_workflow_mod_time_to_context(workflow)
         LOGGER.info(f"Workflow '{workflow.name}' was updated successfully")
@@ -396,6 +401,7 @@ class WorkflowInstaller:
         LOGGER.info(f"Installing new workflow '{workflow.name}'")
         self._define_workflow_as_new(workflow)
         self._process_steps(workflow)
+        self._remove_instance_display_names(workflow)
         self.client.save_playbook(workflow)
         self._save_workflow_mod_time_to_context(workflow)
         LOGGER.info(f"New Playbook '{workflow.name}' was installed successfully")
@@ -555,8 +561,11 @@ class WorkflowInstaller:
     ) -> None:
         """Reconfigure an integration instance of a workflow step.
 
-        If old_steps is supplied, It will first try to match the same step in the old playbook and
-        assign the step to the same integration instance.
+        If the step has the display names of its integration instances (stored on pull), it will
+        first assign the step to the instances with the same display names in this platform, since
+        instance ids are different in every platform.
+        Otherwise, if old_steps is supplied, It will try to match the same step in the old playbook
+        and assign the step to the same integration instance.
         Otherwise, If the playbook is assigned to only one environment (and not all environments),
         it will assign the first integration instance it finds.
         If the playbook is assigned to All Environments or more than one environment, The step will
@@ -570,6 +579,9 @@ class WorkflowInstaller:
             from it instead
 
         """
+        if self._assign_integration_instances_by_display_name(step, environments):
+            return
+
         if existing_step:
             instance = self._get_step_parameter_by_name(
                 existing_step,
@@ -660,6 +672,116 @@ class WorkflowInstaller:
                 del param["InstanceDisplayName"]
             elif param.get("FallbackInstanceDisplayName"):
                 del param["FallbackInstanceDisplayName"]
+
+    def _assign_integration_instances_by_display_name(
+        self,
+        step: dict,
+        environments: list,
+    ) -> bool:
+        """Assign the step to the integration instances of this platform with the same display
+        names as the instances of the platform the step was pulled from.
+
+        Args:
+            step: The step to reconfigure
+            environments: Playbook assigned environments, to choose between instances with the
+            same display name
+
+        Returns:
+            True if the step has instance display names and all of them were found, False
+            otherwise (the step isn't changed)
+
+        """
+        named_params = [
+            (param, param[key])
+            for param in step.get("parameters", [])
+            if (key := INSTANCE_DISPLAY_NAME_KEYS.get(param.get("name")))
+            and param.get(key)
+        ]
+        if not named_params:
+            return False
+
+        instance_ids = [
+            self._find_integration_instance_id(
+                step.get("integration"),
+                display_name,
+                environments,
+            )
+            for _, display_name in named_params
+        ]
+        missing = [
+            display_name
+            for (_, display_name), instance_id in zip(named_params, instance_ids)
+            if not instance_id
+        ]
+        if missing:
+            LOGGER.warning(
+                f"Integration instance(s) {', '.join(missing)} of integration "
+                f"'{step.get('integration')}' used by step '{step.get('instanceName')}' "
+                "weren't found, assigning the step to another instance"
+            )
+            return False
+
+        for (param, _), instance_id in zip(named_params, instance_ids):
+            param["value"] = instance_id
+        return True
+
+    def _find_integration_instance_id(
+        self,
+        integration_name: str,
+        display_name: str,
+        environments: list,
+    ) -> str | None:
+        """Find the id of an integration instance by its display name
+
+        Args:
+            integration_name: The integration of the instance
+            display_name: The display name of the instance
+            environments: Playbook assigned environments, preferred if more than one instance
+            has the display name
+
+        Returns:
+            The integration instance id, or None if not found
+
+        """
+        instances = [
+            x
+            for x in self._get_integration_instances(integration_name)
+            if x.get("displayName") == display_name
+        ]
+        instances = [
+            x for x in instances if x.get("environment") in environments
+        ] or instances
+        if not instances:
+            return None
+        if len(instances) > 1:
+            LOGGER.warning(
+                f"Found {len(instances)} instances of integration '{integration_name}' "
+                f"named '{display_name}', using the first one"
+            )
+        # The instance id is the last part of the resource name
+        return instances[0].get("name", "").rsplit("/", 1)[-1] or None
+
+    def _get_integration_instances(self, integration_name: str) -> list[dict]:
+        """Get all the instances of an integration, empty if the integration isn't installed"""
+        cache_key = f"instances_of_integration_{integration_name}"
+        if cache_key not in self._cache:
+            try:
+                self._cache[cache_key] = self.client.list_integration_instances(
+                    integration_name
+                )
+            except APIError as e:
+                if not _is_not_found(e):
+                    raise
+                LOGGER.warning(f"Integration '{integration_name}' isn't installed")
+                self._cache[cache_key] = []
+        return self._cache.get(cache_key)
+
+    def _remove_instance_display_names(self, workflow: Workflow) -> None:
+        """Remove the instance display names stored on pull, they aren't part of the API"""
+        for step in self._flatten_playbook_steps(workflow.raw_data.get("steps")):
+            for param in step.get("parameters", []):
+                for key in INSTANCE_DISPLAY_NAME_KEYS.values():
+                    param.pop(key, None)
 
     def _get_instance_display_name(
         self,

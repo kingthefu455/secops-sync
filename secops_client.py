@@ -319,6 +319,35 @@ class SecOpsClient:
         except Exception as e:
             raise APIError(f"Failed to retrieve integration instance name: {e}") from e
 
+    def list_integration_instances(self, integration_name: str) -> list[dict[str, Any]]:
+        """Retrieves all the instances of an integration from the Chronicle API."""
+        integration_instances: list[dict[str, Any]] = []
+        next_page_token = None
+        try:
+            while True:
+                parent = f"projects/{self.project_id}/locations/{self.region}/instances/{self.customer_id}"
+                api_path = f"/v1alpha/{parent}/integrations/{integration_name}/integrationInstances"
+
+                params = {}
+                if next_page_token:
+                    params["pageToken"] = next_page_token
+
+                response_json = self._make_request(
+                    method="GET", path=api_path, params=params
+                )
+
+                integration_instances.extend(
+                    response_json.get("integrationInstances", [])
+                )
+                next_page_token = response_json.get("nextPageToken")
+                if not next_page_token:
+                    break
+        except Exception as e:
+            raise APIError(
+                f"Failed to retrieve instances of integration {integration_name}: {e}"
+            ) from e
+        return integration_instances
+
     def get_integrations_instances(self, environment: str) -> list[dict[str, Any]]:
         integration_instances: list[dict[str, Any]] = []
         try:

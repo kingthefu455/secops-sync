@@ -116,7 +116,6 @@ class Workflow(Content):
                 param.pop("creationTimeUnixTimeInMs", None)
                 param.pop("modificationTimeUnixTimeInMs", None)
                 param.pop("additionalProperties", None)
-                param.pop("InstanceDisplayName", None)
         self.isEnabled = self.raw_data.get("isEnabled")
         self.category = self.raw_data.get("categoryName", "Default")
         self.environments = self.raw_data.get("environments", [])
