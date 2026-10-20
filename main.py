@@ -25,6 +25,7 @@ from jinja2 import Template
 from manager import ResponseManager
 from models import SocRole, Workflow, WorkflowMenuCard
 from utils import WD, get_local_playbooks
+from validation import check_playbooks
 
 LOGGER = logging.getLogger("rac")
 
@@ -169,6 +170,24 @@ def pull_playbooks():
     except Exception:
         LOGGER.exception("General error performing Pull Playbooks")
         raise
+
+
+@cli.command(name="validate-playbooks")
+def validate_playbooks():
+    """
+    Check that the playbooks in the Git repository can be synced. Makes no API calls.
+    """
+    report = check_playbooks(WD)
+    # On GitHub Actions, issues are shown on the files of the pull request
+    github = os.environ.get("GITHUB_ACTIONS") == "true"
+    for issue in report.issues:
+        click.echo(issue.format(github))
+    click.echo(
+        f"Checked {report.playbook_count} playbook(s) in {PLAYBOOKS_PATH}/: "
+        f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)"
+    )
+    if report.errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

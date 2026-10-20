@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 from collections.abc import Iterator
+from typing import Any
 
 import playbook_format
 from config import (
@@ -53,31 +54,42 @@ def get_local_playbooks() -> Iterator[Workflow]:
         return
 
     seen: dict[str, str] = {}
+    for path in iter_playbook_paths(root):
+        if os.path.isdir(path):
+            playbook = _read_playbook_dir(path)
+        else:
+            playbook = Workflow(_read_json(path))
+
+        if playbook.name in seen:
+            raise ValueError(
+                f"Playbook '{playbook.name}' is stored twice: "
+                f"{seen[playbook.name]} and {path}"
+            )
+        seen[playbook.name] = path
+        yield playbook
+
+
+def iter_playbook_paths(root: str) -> Iterator[str]:
+    """Yields the folder of every playbook under root, or its file for legacy playbooks."""
     for dir_path, dir_names, file_names in os.walk(root):
         dir_names.sort()
         if PLAYBOOK_DEFINITION_FILE in file_names:
             # The steps folder belongs to this playbook, don't descend into it
             dir_names.clear()
-            playbooks = [(dir_path, _read_playbook_dir(dir_path))]
+            yield dir_path
         else:
-            playbooks = [
-                (path, Workflow(_read_json(path)))
-                for path in (os.path.join(dir_path, f) for f in sorted(file_names))
-                if path.endswith(".json")
-            ]
-
-        for path, playbook in playbooks:
-            if playbook.name in seen:
-                raise ValueError(
-                    f"Playbook '{playbook.name}' is stored twice: "
-                    f"{seen[playbook.name]} and {path}"
-                )
-            seen[playbook.name] = path
-            yield playbook
+            for file_name in sorted(file_names):
+                if file_name.endswith(".json"):
+                    yield os.path.join(dir_path, file_name)
 
 
 def _read_playbook_dir(playbook_dir: str) -> Workflow:
     """Reassembles a playbook from its definition, trigger, overview, step and widget files."""
+    return Workflow(playbook_format.from_files(read_playbook_files(playbook_dir)))
+
+
+def read_playbook_files(playbook_dir: str) -> dict[str, Any]:
+    """Reads the files of a playbook folder in the format playbook_format.from_files takes."""
     files = {
         file_name: _read_json(os.path.join(playbook_dir, file_name))
         for file_name in os.listdir(playbook_dir)
@@ -98,7 +110,7 @@ def _read_playbook_dir(playbook_dir: str) -> Workflow:
                     os.path.join(widgets_dir, file_name), encoding="utf-8", newline=""
                 ) as f:
                     files[f"{PLAYBOOK_WIDGETS_DIR}/{file_name}"] = f.read()
-    return Workflow(playbook_format.from_files(files))
+    return files
 
 
 def _read_json(path: str) -> dict:

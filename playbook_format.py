@@ -32,6 +32,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from collections.abc import Iterator
 from typing import Any
 
 from config import (
@@ -167,6 +168,19 @@ def _join_text(value: Any, files: dict[str, Any]) -> Any:
     if value.keys() == {_FILE_MARKER}:
         return files[value[_FILE_MARKER]]
     return {k: _join_text(v, files) for k, v in value.items()}
+
+
+def iter_file_refs(value: Any) -> Iterator[Any]:
+    """Yields the widget file paths that overview templates data references."""
+    if isinstance(value, list):
+        for item in value:
+            yield from iter_file_refs(item)
+    elif isinstance(value, dict):
+        if value.keys() == {_FILE_MARKER}:
+            yield value[_FILE_MARKER]
+        else:
+            for item in value.values():
+                yield from iter_file_refs(item)
 
 
 def from_files(files: dict[str, Any]) -> dict:
