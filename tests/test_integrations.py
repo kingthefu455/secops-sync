@@ -24,7 +24,7 @@ import utils
 from helpers import write_file
 from manager import ResponseManager
 from models import Integration, IntegrationPackage
-from validation_report import _ChangedFile, _file_attention
+from validation_report import _is_tool_file
 
 FILES = {
     "Integration-MyTools.def": b'{"Identifier": "MyTools"}',
@@ -115,10 +115,8 @@ class InstallIntegrationsTest(unittest.TestCase):
 
 class FileAttentionTest(unittest.TestCase):
     def test_integration_code_isnt_the_sync_tools_code(self):
-        attention = _file_attention(
-            [_ChangedFile("M", "Integrations/MyTools/ActionsScripts/Ping.py", None, 1, 1)]
-        )
-        self.assertEqual(attention, [])
+        self.assertFalse(_is_tool_file("Integrations/MyTools/ActionsScripts/Ping.py"))
+        self.assertTrue(_is_tool_file("main.py"))
 
 
 if __name__ == "__main__":

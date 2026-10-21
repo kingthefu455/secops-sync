@@ -17,36 +17,40 @@
 
     python validation_report.py --base origin/main
 
-The report compares the committed HEAD with its merge base with --base:
+The report compares HEAD with its merge base with --base:
 
 - Needs attention: the changes reviewers should look at first.
 - Playbook changes: the added, changed, renamed and deleted playbooks, with
   the fields, trigger, steps and connections that changed.
-- Findings: the validation findings, grouped into new, already on the base
-  branch, and fixed by the merge request.
+- Findings: the validation findings of the checked out playbooks, grouped
+  into the playbooks the merge request changes and the other playbooks.
 - Other changed files: the changed files outside the playbooks.
 
-The script only reports. It exits with 0 even if there are errors, since the
+The script only prints the report and writes no files: it reads the playbooks
+of both commits from git. To also keep Python from writing its .pyc cache,
+run it with python -B. It exits with 0 even if there are errors, since the
 validate-playbooks command is the check that fails on them.
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
 import re
 import subprocess
 import sys
-import tarfile
-import tempfile
 from collections.abc import Container
 from dataclasses import dataclass
 
 import playbook_format
-from config import INTEGRATIONS_PATH, PLAYBOOKS_PATH
-from utils import iter_playbook_paths, read_playbook_files
+from config import (
+    INTEGRATIONS_PATH,
+    PLAYBOOK_DEFINITION_FILE,
+    PLAYBOOK_STEPS_DIR,
+    PLAYBOOK_WIDGETS_DIR,
+    PLAYBOOKS_PATH,
+)
 from validation import ERROR, Issue, Report, check_playbooks
 
 # Playbook keys that are compared on their own, not as plain fields
@@ -99,13 +103,9 @@ def build_report(repo_root: str, base: str) -> str:
     """Builds the report of the changes from the merge base with base to HEAD."""
     merge_base = _merge_base(repo_root, base)
     head = _git(repo_root, "rev-parse", "HEAD").decode().strip()
-    with tempfile.TemporaryDirectory() as tmp:
-        base_playbooks, base_findings = _read_commit(
-            repo_root, merge_base, os.path.join(tmp, "base")
-        )
-        head_playbooks, head_findings = _read_commit(
-            repo_root, head, os.path.join(tmp, "head")
-        )
+    base_playbooks = _read_playbooks(repo_root, merge_base)
+    head_playbooks = _read_playbooks(repo_root, head)
+    findings = check_playbooks(repo_root)
 
     changes = _compare_playbooks(base_playbooks, head_playbooks)
     changed_files = _changed_files(repo_root, merge_base)
@@ -113,12 +113,16 @@ def build_report(repo_root: str, base: str) -> str:
     other_files = [
         x for x in changed_files if not any(_is_in(x.path, p) for p in playbook_paths)
     ]
+    changed_paths = [x.path for x in changed_files]
+    in_changed_playbooks = [
+        x for x in findings.issues if _is_changed(x.path, playbook_paths, changed_paths)
+    ]
 
     sections = [
-        _summary(head, base, merge_base, base_findings, head_findings),
+        _summary(head, base, merge_base, findings, in_changed_playbooks),
         _attention_section(changes, changed_files),
         _playbooks_section(changes),
-        _findings_section(base_findings, head_findings),
+        _findings_section(findings, in_changed_playbooks),
         _files_section(other_files),
     ]
     return "\n\n".join(x for x in sections if x)
@@ -127,8 +131,10 @@ def build_report(repo_root: str, base: str) -> str:
 # Reading from git
 
 
-def _git(repo_root: str, *args: str) -> bytes:
-    result = subprocess.run(["git", "-C", repo_root, *args], capture_output=True)
+def _git(repo_root: str, *args: str, stdin: bytes | None = None) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", repo_root, *args], input=stdin, capture_output=True
+    )
     if result.returncode != 0:
         error = result.stderr.decode(errors="replace").strip()
         raise ReportError(f"git {' '.join(args)} failed: {error}")
@@ -168,37 +174,67 @@ def _changed_files(repo_root: str, merge_base: str) -> list[ChangedFile]:
     ]
 
 
-def _read_commit(
-    repo_root: str, commit: str, folder: str
-) -> tuple[list[Playbook], Report]:
-    """Reads and checks the playbooks of a commit, extracting them to folder."""
-    os.makedirs(folder)
-    if _git(repo_root, "ls-tree", commit, PLAYBOOKS_PATH):
-        archive = _git(repo_root, "archive", commit, PLAYBOOKS_PATH)
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-            tar.extractall(folder, filter="data")
-    return _load_playbooks(folder), check_playbooks(folder)
+def _read_playbooks(repo_root: str, commit: str) -> list[Playbook]:
+    """Reads the playbooks of a commit from git, in the same layout as utils does.
 
+    A folder with a definition file is a playbook. Any other JSON file is a
+    legacy single-file playbook. Playbooks that can't be read are skipped, the
+    findings report them.
+    """
+    files = _git_files(repo_root, commit, PLAYBOOKS_PATH)
+    folders = {
+        os.path.dirname(x)
+        for x in files
+        if os.path.basename(x) == PLAYBOOK_DEFINITION_FILE
+    }
+    legacy_files = [
+        x for x in files if x.endswith(".json") and not any(_is_in(x, f) for f in folders)
+    ]
 
-def _load_playbooks(repo_root: str) -> list[Playbook]:
-    """Reads the playbooks of a repo. The findings report the ones it can't read."""
-    root = os.path.join(repo_root, PLAYBOOKS_PATH)
-    if not os.path.isdir(root):
-        return []
     playbooks = []
-    for path in iter_playbook_paths(root):
+    for path in sorted(folders) + sorted(legacy_files):
         try:
-            if os.path.isdir(path):
-                data = playbook_format.from_files(read_playbook_files(path))
+            if path in folders:
+                data = playbook_format.from_files(_playbook_files(files, path))
             else:
-                with open(path, encoding="utf-8") as f:
-                    data = json.load(f)
+                data = json.loads(files[path])
         except Exception:  # noqa: BLE001
             continue
         if isinstance(data, dict):
-            relative = os.path.relpath(path, repo_root).replace(os.sep, "/")
-            playbooks.append(Playbook(relative, _without_timestamps(data)))
+            playbooks.append(Playbook(path, _without_timestamps(data)))
     return playbooks
+
+
+def _git_files(repo_root: str, commit: str, folder: str) -> dict[str, bytes]:
+    """Returns the content of the files in a folder of a commit, by path."""
+    listing = _git(repo_root, "ls-tree", "-r", "-z", "--name-only", commit, "--", folder)
+    paths = listing.decode().split("\0")[:-1]
+    # cat-file --batch prints "<sha> <type> <size>", a newline, the content and
+    # a newline for every object it is asked for
+    request = "".join(f"{commit}:{x}\n" for x in paths).encode()
+    output = _git(repo_root, "cat-file", "--batch", stdin=request)
+    files, position = {}, 0
+    for path in paths:
+        header_end = output.index(b"\n", position)
+        size = int(output[position:header_end].split()[2])
+        files[path] = output[header_end + 1 : header_end + 1 + size]
+        position = header_end + 1 + size + 1
+    return files
+
+
+def _playbook_files(files: dict[str, bytes], folder: str) -> dict:
+    """Picks the files of a playbook folder that utils.read_playbook_files reads."""
+    result = {}
+    for path, content in files.items():
+        if not path.startswith(f"{folder}/"):
+            continue
+        name = path[len(folder) + 1 :]
+        subfolder, _, file_name = name.rpartition("/")
+        if subfolder in ("", PLAYBOOK_STEPS_DIR) and file_name.endswith(".json"):
+            result[name] = json.loads(content)
+        elif subfolder == PLAYBOOK_WIDGETS_DIR and file_name.endswith(".html"):
+            result[name] = content.decode("utf-8")
+    return result
 
 
 def _without_timestamps(value: object) -> object:
@@ -378,20 +414,23 @@ def _step_label(step: dict) -> str:
 
 
 def _summary(
-    head: str, base: str, merge_base: str, base_findings: Report, head_findings: Report
+    head: str,
+    base: str,
+    merge_base: str,
+    findings: Report,
+    in_changed_playbooks: list[Issue],
 ) -> str:
     if merge_base.startswith(base):
         compared = f"its merge base `{merge_base[:7]}`"
     else:
         compared = f"`{base}` (merge base `{merge_base[:7]}`)"
 
-    errors, warnings = head_findings.errors, head_findings.warnings
-    base_errors = {_finding_key(x) for x in base_findings.errors}
-    new_errors = [x for x in errors if _finding_key(x) not in base_errors]
+    errors, warnings = findings.errors, findings.warnings
+    changed_errors = [x for x in in_changed_playbooks if x.severity == ERROR]
     if errors:
         result = (
-            f"❌ {len(errors)} error(s), {len(new_errors)} of them new in this "
-            f"merge request, and {len(warnings)} warning(s)"
+            f"❌ {len(errors)} error(s), {len(changed_errors)} of them in playbooks "
+            f"this merge request changes, and {len(warnings)} warning(s)"
         )
     else:
         result = f"✅ No errors, {len(warnings)} warning(s)"
@@ -400,7 +439,7 @@ def _summary(
         [
             "# Validation report",
             f"Compares `HEAD` (`{head[:7]}`) with {compared}.",
-            f"**Result:** {result}. Checked {head_findings.playbook_count} playbook(s).",
+            f"**Result:** {result}. Checked {findings.playbook_count} playbook(s).",
         ]
     )
 
@@ -462,18 +501,11 @@ def _playbooks_section(changes: list[PlaybookChange]) -> str:
     return "\n".join(lines)
 
 
-def _findings_section(base_findings: Report, head_findings: Report) -> str:
-    base_keys = {_finding_key(x) for x in base_findings.issues}
-    head_keys = {_finding_key(x) for x in head_findings.issues}
+def _findings_section(findings: Report, in_changed_playbooks: list[Issue]) -> str:
     groups = {
-        "New in this merge request": [
-            x for x in head_findings.issues if _finding_key(x) not in base_keys
-        ],
-        "Already on the base branch": [
-            x for x in head_findings.issues if _finding_key(x) in base_keys
-        ],
-        "Fixed by this merge request": [
-            x for x in base_findings.issues if _finding_key(x) not in head_keys
+        "In playbooks this merge request changes": in_changed_playbooks,
+        "In other playbooks": [
+            x for x in findings.issues if x not in in_changed_playbooks
         ],
     }
     lines = ["## Findings"]
@@ -494,27 +526,25 @@ def _files_section(files: list[ChangedFile]) -> str:
     return "\n".join(lines)
 
 
-def _finding_key(issue: Issue) -> tuple[str, str, str]:
-    # Lines move when files change, so they aren't part of the key
-    return issue.severity, issue.path, issue.message
-
-
 def _finding(issue: Issue) -> str:
     icon = "❌ Error" if issue.severity == ERROR else "⚠️ Warning"
     location = f"{issue.path}:{issue.line}" if issue.line else issue.path
     return f"- {icon} {_code(location)}: {_md(issue.message)}"
 
 
+def _is_changed(path: str, playbook_paths: list[str], changed_paths: list[str]) -> bool:
+    """Whether the merge request changes the playbook of a path, or the path itself."""
+    playbook = next((x for x in playbook_paths if _is_in(path, x)), path)
+    return any(_is_in(x, playbook) for x in changed_paths)
+
+
 def _is_tool_file(path: str) -> bool:
     """Whether the file belongs to the sync tool or the pipeline that checks it."""
-    return (
-        (
-            path.endswith(".py")
-            and not path.startswith(("tests/", f"{INTEGRATIONS_PATH}/"))
-        )
-        or path in ("requirements.txt", ".gitlab-ci.yml")
-        or path.startswith(".github/")
+    # Integrations holds the code of the pulled integrations, not of this tool
+    is_code = path.endswith(".py") and not path.startswith(
+        ("tests/", f"{INTEGRATIONS_PATH}/")
     )
+    return is_code or path in ("requirements.txt", ".gitlab-ci.yml")
 
 
 # Small helpers
