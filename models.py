@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
 import uuid
+import zipfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
@@ -73,6 +75,47 @@ class WorkflowMenuCard:
     categoryName: str
     modification_time: int
     playbookType: str
+
+
+@dataclass
+class Integration:
+    """Represents an integration installed in Chronicle."""
+
+    # Resource name: projects/.../instances/.../integrations/<id>
+    name: str
+    identifier: str
+    displayName: str
+    custom: bool
+    staging: bool
+
+
+class IntegrationPackage:
+    """The files of an integration's ZIP package, by path inside the ZIP."""
+
+    def __init__(self, identifier: str, files: dict[str, bytes]):
+        self.identifier = identifier
+        self.files = files
+
+    @classmethod
+    def from_zip(cls, identifier: str, data: bytes) -> "IntegrationPackage":
+        with zipfile.ZipFile(io.BytesIO(data)) as package:
+            files = {
+                info.filename: package.read(info)
+                for info in package.infolist()
+                if not info.is_dir()
+            }
+        return cls(identifier, files)
+
+    def to_zip(self) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as package:
+            for path in sorted(self.files):
+                package.writestr(path, self.files[path])
+        return buffer.getvalue()
+
+    def iter_files(self) -> Iterator[File]:
+        for path in sorted(self.files):
+            yield File(path, self.files[path])
 
 
 class WorkflowTypes(Enum):

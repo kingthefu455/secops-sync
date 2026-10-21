@@ -22,12 +22,13 @@ from typing import Any
 
 import playbook_format
 from config import (
+    INTEGRATIONS_PATH,
     PLAYBOOK_DEFINITION_FILE,
     PLAYBOOK_STEPS_DIR,
     PLAYBOOK_WIDGETS_DIR,
     PLAYBOOKS_PATH,
 )
-from models import File, Workflow
+from models import File, IntegrationPackage, Workflow
 
 LOGGER = logging.getLogger("rac")
 WD = os.path.abspath(".")
@@ -142,6 +143,48 @@ def push_playbook(playbook: Workflow) -> None:
     update_objects(
         playbook.iter_files(), base_path=path, replace_content_in_base_path=True
     )
+
+
+def get_local_integrations() -> Iterator[IntegrationPackage]:
+    """Reads all integration packages from the repo, one per folder."""
+    root = os.path.join(WD, INTEGRATIONS_PATH)
+    if not os.path.isdir(root):
+        LOGGER.warning(f"Integrations path not found: {root}")
+        return
+
+    for identifier in sorted(os.listdir(root)):
+        integration_dir = os.path.join(root, identifier)
+        if not os.path.isdir(integration_dir):
+            continue
+        files = {}
+        for dir_path, _, file_names in os.walk(integration_dir):
+            for file_name in file_names:
+                path = os.path.join(dir_path, file_name)
+                relative = os.path.relpath(path, integration_dir).replace(os.sep, "/")
+                with open(path, "rb") as f:
+                    files[relative] = f.read()
+        yield IntegrationPackage(identifier, files)
+
+
+def push_integration(package: IntegrationPackage) -> None:
+    """Writes the files of an integration package to the repo.
+
+    Raises:
+        ValueError: If the integration identifier can't be used as a folder name.
+    """
+    identifier = package.identifier
+    if identifier in ("", ".", "..") or "/" in identifier or "\\" in identifier:
+        raise ValueError(
+            f"Can't store integration '{identifier}': "
+            "its identifier isn't a valid folder name"
+        )
+    # Replace the whole folder so files removed from the package don't linger
+    update_objects(
+        package.iter_files(),
+        base_path=f"{INTEGRATIONS_PATH}/{identifier}",
+        replace_content_in_base_path=True,
+    )
+
 
 def update_objects(
     files: list[File], base_path: str = "", replace_content_in_base_path: bool = False

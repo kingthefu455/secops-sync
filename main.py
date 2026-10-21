@@ -19,12 +19,12 @@ import shutil
 import sys
 
 import click
-from config import EXCLUDE_FOLDER, INCLUDE_BLOCKS, PLAYBOOKS_PATH
+from config import EXCLUDE_FOLDER, INCLUDE_BLOCKS, INTEGRATIONS_PATH, PLAYBOOKS_PATH
 from constants import PLAYBOOKS_ROOT_README
 from jinja2 import Template
 from manager import ResponseManager
-from models import SocRole, Workflow, WorkflowMenuCard
-from utils import WD, get_local_playbooks
+from models import Integration, SocRole, Workflow, WorkflowMenuCard
+from utils import WD, get_local_integrations, get_local_playbooks
 from validation import check_playbooks
 
 LOGGER = logging.getLogger("rac")
@@ -169,6 +169,58 @@ def pull_playbooks():
 
     except Exception:
         LOGGER.exception("General error performing Pull Playbooks")
+        raise
+
+
+@cli.command(name="sync-integrations")
+def sync_integrations():
+    """
+    Install or update the integrations in the Git repository on the SOAR platform.
+    """
+    response_manager = ResponseManager()
+
+    try:
+        git_integrations = list(get_local_integrations())
+        LOGGER.info(f"Git Integrations len {len(git_integrations)}")
+        response_manager.install_integrations(git_integrations)
+
+    except Exception:
+        LOGGER.exception("General error performing Sync Integrations")
+        raise
+
+
+@cli.command(name="pull-integrations")
+def pull_integrations():
+    """
+    Synchronize custom integrations from the SOAR platform to a Git repository.
+    """
+    response_manager = ResponseManager()
+
+    try:
+        installed_integrations: list[Integration] = response_manager.get_integrations()
+
+        # The repo mirrors the instance, so start from an empty integrations folder.
+        # Deleted integrations and removed files then don't leave old files behind.
+        integrations_dir = os.path.join(WD, INTEGRATIONS_PATH)
+        if os.path.isdir(integrations_dir):
+            shutil.rmtree(integrations_dir)
+
+        for integration in installed_integrations:
+            # Commercial integrations come from the marketplace, and staging
+            # integrations are test copies of the production ones
+            if not integration.custom or integration.staging:
+                LOGGER.info(
+                    f"Skip integration since it isn't a custom production integration: {integration.displayName}"
+                )
+                continue
+
+            LOGGER.info(f"Processing Integration {integration.displayName}")
+            response_manager.store_integration(
+                response_manager.get_integration_package(integration)
+            )
+
+    except Exception:
+        LOGGER.exception("General error performing Pull Integrations")
         raise
 
 

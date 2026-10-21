@@ -41,7 +41,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 
 import playbook_format
-from config import PLAYBOOK_WIDGETS_DIR, PLAYBOOKS_PATH
+from config import INTEGRATIONS_PATH, PLAYBOOK_WIDGETS_DIR, PLAYBOOKS_PATH
 from utils import iter_playbook_paths, read_playbook_files
 from validation import ERROR, Issue, Report, check_playbooks
 
@@ -616,7 +616,10 @@ def _file_attention(changed_files: list[_ChangedFile]) -> list[str]:
     tool = [
         x.path
         for x in changed_files
-        if (x.path.endswith(".py") and not x.path.startswith("tests/"))
+        if (
+            x.path.endswith(".py")
+            and not x.path.startswith(("tests/", f"{INTEGRATIONS_PATH}/"))
+        )
         or x.path == "requirements.txt"
     ]
     checks = [x.path for x in changed_files if x.path.startswith(".github/")]

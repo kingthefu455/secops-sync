@@ -24,10 +24,19 @@ from cache import Cache
 from config import   SECOPS_CUSTOMER_ID, SECOPS_PROJECT_ID,SECOPS_REGION
 from constants import ALL_ENVIRONMENTS_IDENTIFIER, ROOT_README, STEP_TYPE
 from jinja2 import Template
-from models import APIError, File, SocRole, Workflow, WorkflowMenuCard, WorkflowTypes
+from models import (
+    APIError,
+    File,
+    Integration,
+    IntegrationPackage,
+    SocRole,
+    Workflow,
+    WorkflowMenuCard,
+    WorkflowTypes,
+)
 from requests.exceptions import HTTPError
 from secops_client import SecOpsClient
-from utils import WD, push_playbook, update_objects
+from utils import WD, push_integration, push_playbook, update_objects
 
 LOGGER = logging.getLogger("rac")
 
@@ -117,6 +126,55 @@ class ResponseManager:
 
         for playbook in playbooks:
             playbook_installer.install_workflow(playbook)
+
+    def get_integrations(self) -> list[Integration]:
+        """Retrieves a list of all integrations installed in the instance."""
+        return self.client.list_integrations()
+
+    def get_integration_package(self, integration: Integration) -> IntegrationPackage:
+        """Exports the package of an installed integration."""
+        return IntegrationPackage.from_zip(
+            integration.identifier, self.client.export_integration(integration)
+        )
+
+    def store_integration(self, package: IntegrationPackage) -> None:
+        """Writes an integration package to the repo"""
+        push_integration(package)
+
+    def install_integrations(self, packages: list[IntegrationPackage]) -> None:
+        """Install or update integrations from their packages
+
+        An integration is only imported if it isn't installed, or if its
+        installed package differs from the one in the repo.
+
+        Args:
+            packages: A list of integration packages to install
+
+        """
+        installed = {
+            x.identifier: x for x in self.get_integrations() if not x.staging
+        }
+        for package in packages:
+            integration = installed.get(package.identifier)
+            if integration is None:
+                LOGGER.info(f"Installing new integration '{package.identifier}'")
+            elif self.get_integration_package(integration).files == package.files:
+                LOGGER.info(
+                    f"Skipped update for unchanged integration '{package.identifier}'"
+                )
+                continue
+            else:
+                LOGGER.info(f"Updating existing integration '{package.identifier}'")
+
+            result = self.client.import_integration(
+                package.identifier, package.to_zip()
+            )
+            if result.get("failedDependencies"):
+                LOGGER.warning(
+                    f"Integration '{package.identifier}' was imported, but some of "
+                    f"its dependencies failed: {result['failedDependencies']}"
+                )
+            LOGGER.info(f"Integration '{package.identifier}' was imported successfully")
 
 
     def generate_root_readme(self) -> str:
