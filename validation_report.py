@@ -13,12 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prints a Markdown report of what a pull request changes and what the validation finds.
+"""Prints a Markdown report of what a merge request changes and what the validation finds.
 
     python validation_report.py --base origin/main
 
 Compares the committed HEAD with its merge base with --base: the playbooks the
-pull request adds, deletes, renames or changes (down to steps, parameters,
+merge request adds, deletes, renames or changes (down to steps, parameters,
 connections and the trigger), the other files it changes, and the validation
 findings it adds, fixes or leaves as they are.
 
@@ -94,10 +94,14 @@ def build_report(repo_root: str, base: str) -> str:
         base_findings = check_playbooks(base_root)
         head_findings = check_playbooks(head_root)
 
+    if merge_base.startswith(base):
+        compared = f"its merge base `{merge_base[:7]}`"
+    else:
+        compared = f"`{base}` (merge base `{merge_base[:7]}`)"
     lines = [
         "# Validation report",
         "",
-        f"Compares `HEAD` (`{head[:7]}`) with `{base}` (merge base `{merge_base[:7]}`).",
+        f"Compares `HEAD` (`{head[:7]}`) with {compared}.",
         "",
         _result_line(base_findings, head_findings),
         "",
@@ -236,7 +240,7 @@ def _result_line(base_findings: Report, head_findings: Report) -> str:
     new = [x for x in errors if _finding_key(x) not in base_keys]
     return (
         f"**Result:** ❌ {len(errors)} error(s), {len(new)} of them new in this "
-        f"pull request, and {len(warnings)} warning(s). {checked}."
+        f"merge request, and {len(warnings)} warning(s). {checked}."
     )
 
 
@@ -586,7 +590,7 @@ def _findings(base_findings: Report, head_findings: Report) -> list[str]:
     head_issues, base_issues = head_findings.issues, base_findings.issues
     groups = [
         (
-            "New in this pull request",
+            "New in this merge request",
             [x for x in head_issues if _finding_key(x) not in base_keys],
         ),
         (
@@ -594,7 +598,7 @@ def _findings(base_findings: Report, head_findings: Report) -> list[str]:
             [x for x in head_issues if _finding_key(x) in base_keys],
         ),
         (
-            "Fixed by this pull request",
+            "Fixed by this merge request",
             [x for x in base_issues if _finding_key(x) not in head_keys],
         ),
     ]
@@ -689,13 +693,13 @@ def _value(value: object) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Prints a Markdown report of what a pull request changes "
+        description="Prints a Markdown report of what a merge request changes "
         "and what the validation finds."
     )
     parser.add_argument(
         "--base",
         default="origin/main",
-        help="Branch or commit the pull request is merged into (default: origin/main)",
+        help="Branch or commit the merge request is merged into (default: origin/main)",
     )
     args = parser.parse_args()
     try:

@@ -107,7 +107,7 @@ class BuildReportTest(unittest.TestCase):
 
         report = build_report(self.repo, "main")
 
-        self.assertIn("**Result:** ❌ 2 error(s), 1 of them new in this pull request", report)
+        self.assertIn("**Result:** ❌ 2 error(s), 1 of them new in this merge request", report)
         for line in (
             # Needs attention
             "- **Phishing Triage** is now disabled",
@@ -132,11 +132,11 @@ class BuildReportTest(unittest.TestCase):
             "- Connection removed: **Get Case Data** → **Enrich**",
             "- Moved from `Playbooks/Default/malware` to `Playbooks/Default/malware_response`",
             # Findings
-            "### New in this pull request (1)",
+            "### New in this merge request (1)",
             "- ❌ Error `Playbooks/Default/new_playbook/steps/enrich_bbbbb.json`:",
             "### Already on the base branch (1)",
             "- ❌ Error `Playbooks/Default/broken/steps/get_case_data_aaaaa.json`:",
-            "### Fixed by this pull request (1)",
+            "### Fixed by this merge request (1)",
             "- ❌ Error `Playbooks/Default/to_fix/steps/get_case_data_aaaaa.json`:",
             # Other files
             "| `main.py` | Modified | +1 −1 |",
