@@ -41,6 +41,10 @@ PLAYBOOK_STEPS_DIR = "steps"
 PLAYBOOK_WIDGETS_DIR = "widgets"
 INCLUDE_BLOCKS = os.getenv("INCLUDE_BLOCKS", "true").lower() == "true"
 
+INTEGRATIONS_PATH = "Integrations"
+# Each integration is stored in a folder named after its identifier, holding the
+# files of the ZIP package the API exports and imports, unchanged.
+
 EXCLUDE_FOLDER = os.getenv("EXCLUDE_FOLDER")
 
 GITHUB_OUTPUT_FILE = os.getenv("GITHUB_OUTPUT")

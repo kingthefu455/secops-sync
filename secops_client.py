@@ -22,7 +22,14 @@ from typing import Any
 import google.auth
 import google.auth.transport.requests
 import requests
-from models import APIError, SocRole, Workflow, WorkflowCategory, WorkflowMenuCard
+from models import (
+    APIError,
+    Integration,
+    SocRole,
+    Workflow,
+    WorkflowCategory,
+    WorkflowMenuCard,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -318,6 +325,76 @@ class SecOpsClient:
             return response_json.get("displayName", "")
         except Exception as e:
             raise APIError(f"Failed to retrieve integration instance name: {e}") from e
+
+    def list_integrations(self) -> list[Integration]:
+        """Retrieves a list of all integrations installed in the instance."""
+        integrations: list[Integration] = []
+        next_page_token = None
+        try:
+            while True:
+                parent = f"projects/{self.project_id}/locations/{self.region}/instances/{self.customer_id}"
+                api_path = f"/v1alpha/{parent}/integrations"
+
+                params = {}
+                if next_page_token:
+                    params["pageToken"] = next_page_token
+
+                response_json = self._make_request(
+                    method="GET", path=api_path, params=params
+                )
+
+                for integration_data in response_json.get("integrations", []):
+                    integrations.append(
+                        Integration(
+                            name=integration_data.get("name", ""),
+                            identifier=integration_data.get("identifier", ""),
+                            displayName=integration_data.get("displayName", ""),
+                            custom=integration_data.get("custom", False),
+                            staging=integration_data.get("staging", False),
+                        )
+                    )
+                next_page_token = response_json.get("nextPageToken")
+                if not next_page_token:
+                    break
+        except Exception as e:
+            raise APIError(f"Failed to retrieve integrations: {e}") from e
+        return integrations
+
+    def export_integration(self, integration: Integration) -> bytes:
+        """Exports the package of an integration as ZIP bytes."""
+        try:
+            response = self._request(
+                method="GET",
+                path=f"/v1alpha/{integration.name}:export",
+                params={"alt": "media"},
+            )
+            # The ZIP comes as is, or base64 encoded in a JSON media object
+            if "application/json" not in response.headers.get("Content-Type", "").lower():
+                return response.content
+            inline = response.json().get("media", {}).get("inline")
+            if inline is None:
+                raise APIError("The response holds no package")
+            return base64.b64decode(inline)
+        except Exception as e:
+            raise APIError(
+                f"Failed to export integration {integration.identifier}: {e}"
+            ) from e
+
+    def import_integration(self, identifier: str, package: bytes) -> dict[str, Any]:
+        """Imports an integration package, which installs or updates the integration."""
+        try:
+            parent = f"projects/{self.project_id}/locations/{self.region}/instances/{self.customer_id}"
+            api_path = f"/upload/v1alpha/{parent}/integrations:import"
+
+            response = self._request(
+                method="POST",
+                path=api_path,
+                params={"staging": "false"},
+                files={"file": (f"{identifier}.zip", package, "application/zip")},
+            )
+            return response.json() if response.content else {}
+        except Exception as e:
+            raise APIError(f"Failed to import integration {identifier}: {e}") from e
 
     def get_integrations_instances(self, environment: str) -> list[dict[str, Any]]:
         integration_instances: list[dict[str, Any]] = []
