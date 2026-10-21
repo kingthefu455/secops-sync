@@ -25,9 +25,9 @@ validate:
     - python -m unittest discover -s tests -v
     - python main.py validate-playbooks
 
-# Writes the report of the changes and findings of the merge request to the
-# job log and to the validation-report.md artifact. Runs next to validate, so
-# it also runs when a check fails, and only fails if it can't write the report.
+# Prints the report of the changes and findings of the merge request to the
+# job log. Runs next to validate, so it also runs when a check fails, and only
+# fails if it can't build the report.
 validation-report:
   stage: validate
   extends: .merge_request_only
@@ -37,11 +37,4 @@ validation-report:
     GIT_DEPTH: "0"
   script:
     - git config --global --add safe.directory "$CI_PROJECT_DIR"
-    - python validation_report.py --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" > validation-report.md
-    - cat validation-report.md
-  artifacts:
-    name: validation-report
-    paths:
-      - validation-report.md
-    when: always
-    expire_in: 30 days
+    - python validation_report.py --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
