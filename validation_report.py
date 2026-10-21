@@ -13,44 +13,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prints a Markdown report of what a pull request changes and what the validation finds.
+"""Prints a report of what a merge request changes and what the validation finds.
 
     python validation_report.py --base origin/main
 
-Compares the committed HEAD with its merge base with --base: the playbooks the
-pull request adds, deletes, renames or changes (down to steps, parameters,
-connections and the trigger), the other files it changes, and the validation
-findings it adds, fixes or leaves as they are.
+The report compares HEAD with its merge base with --base:
 
-The script only reports. It exits with 0 even if there are errors, since the
+- Needs attention: the changes reviewers should look at first.
+- Playbook changes: the added, changed, renamed and deleted playbooks, with
+  the fields, trigger, steps and connections that changed.
+- Findings: the validation findings of the checked out playbooks, grouped
+  into the playbooks the merge request changes and the other playbooks.
+- Other changed files: the changed files outside the playbooks.
+
+The script only prints the report and writes no files: it reads the playbooks
+of both commits from git. To also keep Python from writing its .pyc cache,
+run it with python -B. It exits with 0 even if there are errors, since the
 validate-playbooks command is the check that fails on them.
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
-import re
 import subprocess
 import sys
-import tarfile
-import tempfile
-from collections.abc import Set as AbstractSet
+from collections.abc import Container
 from dataclasses import dataclass
 
 import playbook_format
-from config import INTEGRATIONS_PATH, PLAYBOOK_WIDGETS_DIR, PLAYBOOKS_PATH
-from utils import iter_playbook_paths, read_playbook_files
+from config import (
+    INTEGRATIONS_PATH,
+    PLAYBOOK_DEFINITION_FILE,
+    PLAYBOOK_STEPS_DIR,
+    PLAYBOOK_WIDGETS_DIR,
+    PLAYBOOKS_PATH,
+)
 from validation import ERROR, Issue, Report, check_playbooks
 
-# Parts of a playbook compared on their own, instead of as definition fields
-_PARTS = {"steps", "stepsRelations", "trigger", "overviewTemplates"}
-# Longer values are only reported as changed, without the values
+# Playbook keys that are compared on their own, not as plain fields
+_PARTS = {"name", "trigger", "steps", "stepsRelations", "overviewTemplates"}
+# Longer values are reported as changed, without showing them
 _MAX_VALUE_LENGTH = 80
-# Most changes listed for one playbook
-_MAX_CHANGES = 40
+_FILE_STATUSES = {"A": "Added", "D": "Deleted", "M": "Modified", "T": "Type changed"}
 
 
 class ReportError(Exception):
@@ -58,76 +64,76 @@ class ReportError(Exception):
 
 
 @dataclass(eq=False)
-class _Playbook:
-    # Folder, or file of a legacy playbook, relative to the repo root
-    path: str
-    raw_data: dict
-    # Widget HTML files of the folder by path, empty for legacy playbooks
-    widgets: dict[str, str]
+class Playbook:
+    path: str  # Folder, or file of a legacy playbook, relative to the repo root
+    data: dict  # The playbook as the API takes it, without timestamps
 
     @property
     def name(self) -> str:
-        return str(self.raw_data.get("name") or self.path)
+        return str(self.data.get("name") or self.path)
 
 
 @dataclass
-class _ChangedFile:
+class PlaybookChange:
+    old: Playbook | None  # None if the merge request adds the playbook
+    new: Playbook | None  # None if the merge request deletes the playbook
+    details: list[str]  # What changed, one line per change
+
+    @property
+    def kind(self) -> str:
+        if self.old is None:
+            return "Added"
+        if self.new is None:
+            return "Deleted"
+        return "Renamed" if self.old.name != self.new.name else "Changed"
+
+    @property
+    def playbook(self) -> Playbook:
+        return self.new or self.old
+
+
+@dataclass
+class ChangedFile:
     status: str
     path: str
-    old_path: str | None
-    lines_added: int | None
-    lines_deleted: int | None
 
 
 def build_report(repo_root: str, base: str) -> str:
     """Builds the report of the changes from the merge base with base to HEAD."""
     merge_base = _merge_base(repo_root, base)
     head = _git(repo_root, "rev-parse", "HEAD").decode().strip()
+    base_playbooks = _read_playbooks(repo_root, merge_base)
+    head_playbooks = _read_playbooks(repo_root, head)
+    findings = check_playbooks(repo_root)
+
+    changes = _compare_playbooks(base_playbooks, head_playbooks)
     changed_files = _changed_files(repo_root, merge_base)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        base_root, head_root = os.path.join(tmp, "base"), os.path.join(tmp, "head")
-        _export_playbooks(repo_root, merge_base, base_root)
-        _export_playbooks(repo_root, head, head_root)
-        base_playbooks = _load_playbooks(base_root)
-        head_playbooks = _load_playbooks(head_root)
-        base_findings = check_playbooks(base_root)
-        head_findings = check_playbooks(head_root)
-
-    lines = [
-        "# Validation report",
-        "",
-        f"Compares `HEAD` (`{head[:7]}`) with `{base}` (merge base `{merge_base[:7]}`).",
-        "",
-        _result_line(base_findings, head_findings),
-        "",
-    ]
-    attention: list[str] = []
-    playbook_lines = _playbook_changes(
-        base_playbooks, head_playbooks, changed_files, attention
-    )
+    playbook_paths = [x.path for x in base_playbooks + head_playbooks]
     other_files = [
-        x
-        for x in changed_files
-        if not any(
-            _contains(p.path, path)
-            for p in base_playbooks + head_playbooks
-            for path in (x.path, x.old_path)
-            if path
-        )
+        x for x in changed_files if not any(_is_in(x.path, p) for p in playbook_paths)
     ]
-    attention += _file_attention(changed_files)
+    changed_paths = [x.path for x in changed_files]
+    in_changed_playbooks = [
+        x for x in findings.issues if _is_changed(x.path, playbook_paths, changed_paths)
+    ]
 
-    if attention:
-        lines += ["## Needs attention", ""] + [f"- {x}" for x in attention] + [""]
-    lines += ["## Playbook changes", ""] + playbook_lines
-    lines += ["## Findings", ""] + _findings(base_findings, head_findings)
-    lines += ["## Other changed files", ""] + _file_table(other_files)
-    return "\n".join(lines)
+    sections = [
+        _summary(head, base, merge_base, findings, in_changed_playbooks),
+        _section("Needs attention", _attention(changes, changed_files)),
+        _section("Playbook changes", _playbook_lines(changes)),
+        _section("Findings", _finding_lines(findings, in_changed_playbooks)),
+        _section("Other changed files", [f"{x.status}: {x.path}" for x in other_files]),
+    ]
+    return "\n\n".join(sections)
 
 
-def _git(repo_root: str, *args: str) -> bytes:
-    result = subprocess.run(["git", "-C", repo_root, *args], capture_output=True)
+# Reading from git
+
+
+def _git(repo_root: str, *args: str, stdin: bytes | None = None) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", repo_root, *args], input=stdin, capture_output=True
+    )
     if result.returncode != 0:
         error = result.stderr.decode(errors="replace").strip()
         raise ReportError(f"git {' '.join(args)} failed: {error}")
@@ -135,6 +141,7 @@ def _git(repo_root: str, *args: str) -> bytes:
 
 
 def _merge_base(repo_root: str, base: str) -> str:
+    """Returns the commit where HEAD branched off from base."""
     try:
         _git(repo_root, "rev-parse", "--verify", f"{base}^{{commit}}")
     except ReportError:
@@ -146,565 +153,424 @@ def _merge_base(repo_root: str, base: str) -> str:
     except ReportError:
         raise ReportError(
             f"HEAD and {base} have no common commit. A shallow clone needs more "
-            "history, for example actions/checkout with fetch-depth: 0"
+            "history, for example GIT_DEPTH: 0 in GitLab CI"
         ) from None
 
 
-def _changed_files(repo_root: str, merge_base: str) -> list[_ChangedFile]:
-    """Lists the files changed from merge_base to HEAD, with renames detected."""
-    tokens = _git(repo_root, "diff", "--name-status", "-M", "-z", merge_base, "HEAD")
-    tokens = tokens.decode(errors="replace").split("\0")
-    files: list[_ChangedFile] = []
-    i = 0
-    while i < len(tokens) and tokens[i]:
-        status = tokens[i]
-        if status[0] in "RC":
-            files.append(_ChangedFile(status[0], tokens[i + 2], tokens[i + 1], None, None))
-            i += 3
-        else:
-            files.append(_ChangedFile(status[0], tokens[i + 1], None, None, None))
-            i += 2
+def _changed_files(repo_root: str, merge_base: str) -> list[ChangedFile]:
+    """Lists the files changed from merge_base to HEAD.
 
-    # Binary files have "-" instead of line counts
-    tokens = _git(repo_root, "diff", "--numstat", "-M", "-z", merge_base, "HEAD")
-    tokens = tokens.decode(errors="replace").split("\0")
-    counts: dict[str, tuple[int | None, int | None]] = {}
-    i = 0
-    while i < len(tokens) and tokens[i]:
-        added, deleted, path = tokens[i].split("\t", 2)
-        if path:
-            i += 1
-        else:
-            # Renamed: the old and the new path follow
-            path = tokens[i + 2]
-            i += 3
-        counts[path] = (
-            int(added) if added.isdigit() else None,
-            int(deleted) if deleted.isdigit() else None,
-        )
-    for file in files:
-        file.lines_added, file.lines_deleted = counts.get(file.path, (None, None))
-    return files
+    A renamed file is listed as deleted and added.
+    """
+    output = _git(
+        repo_root, "diff", "--name-status", "--no-renames", "-z", merge_base, "HEAD"
+    )
+    # The output alternates between a status letter and a path, each ending with NUL
+    fields = output.decode(errors="replace").split("\0")[:-1]
+    return [
+        ChangedFile(_FILE_STATUSES.get(status, status), path)
+        for status, path in zip(fields[::2], fields[1::2], strict=True)
+    ]
 
 
-def _export_playbooks(repo_root: str, revision: str, dest: str) -> None:
-    """Writes the playbooks folder of a commit to dest."""
-    os.makedirs(dest)
-    if not _git(repo_root, "ls-tree", "--name-only", revision, PLAYBOOKS_PATH).strip():
-        return
-    archive = _git(repo_root, "archive", "--format=tar", revision, PLAYBOOKS_PATH)
-    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-        tar.extractall(dest, filter="data")
+def _read_playbooks(repo_root: str, commit: str) -> list[Playbook]:
+    """Reads the playbooks of a commit from git, in the same layout as utils does.
 
+    A folder with a definition file is a playbook. Any other JSON file is a
+    legacy single-file playbook. Playbooks that can't be read are skipped, the
+    findings report them.
+    """
+    files = _git_files(repo_root, commit, PLAYBOOKS_PATH)
+    folders = {
+        os.path.dirname(x)
+        for x in files
+        if os.path.basename(x) == PLAYBOOK_DEFINITION_FILE
+    }
+    legacy_files = [
+        x for x in files if x.endswith(".json") and not any(_is_in(x, f) for f in folders)
+    ]
 
-def _load_playbooks(repo_root: str) -> list[_Playbook]:
-    """Reads the playbooks of a repo. Unreadable ones are left to the findings."""
-    root = os.path.join(repo_root, PLAYBOOKS_PATH)
-    if not os.path.isdir(root):
-        return []
     playbooks = []
-    for path in iter_playbook_paths(root):
+    for path in sorted(folders) + sorted(legacy_files):
         try:
-            if os.path.isdir(path):
-                files = read_playbook_files(path)
-                raw_data = playbook_format.from_files(files)
+            if path in folders:
+                data = playbook_format.from_files(_playbook_files(files, path))
             else:
-                files = {}
-                with open(path, encoding="utf-8") as f:
-                    raw_data = json.load(f)
+                data = json.loads(files[path])
         except Exception:  # noqa: BLE001
             continue
-        if isinstance(raw_data, dict):
-            widgets = {
-                k: v for k, v in files.items() if k.startswith(f"{PLAYBOOK_WIDGETS_DIR}/")
-            }
-            relative = os.path.relpath(path, repo_root).replace(os.sep, "/")
-            playbooks.append(_Playbook(relative, raw_data, widgets))
+        if isinstance(data, dict):
+            playbooks.append(Playbook(path, _without_timestamps(data)))
     return playbooks
 
 
-def _contains(playbook_path: str, path: str) -> bool:
-    return path == playbook_path or path.startswith(f"{playbook_path}/")
+def _git_files(repo_root: str, commit: str, folder: str) -> dict[str, bytes]:
+    """Returns the content of the files in a folder of a commit, by path."""
+    listing = _git(repo_root, "ls-tree", "-r", "-z", "--name-only", commit, "--", folder)
+    paths = listing.decode().split("\0")[:-1]
+    # cat-file --batch prints "<sha> <type> <size>", a newline, the content and
+    # a newline for every object it is asked for
+    request = "".join(f"{commit}:{x}\n" for x in paths).encode()
+    output = _git(repo_root, "cat-file", "--batch", stdin=request)
+    files, position = {}, 0
+    for path in paths:
+        header_end = output.index(b"\n", position)
+        size = int(output[position:header_end].split()[2])
+        files[path] = output[header_end + 1 : header_end + 1 + size]
+        position = header_end + 1 + size + 1
+    return files
 
 
-def _result_line(base_findings: Report, head_findings: Report) -> str:
-    errors, warnings = head_findings.errors, head_findings.warnings
-    checked = f"Checked {head_findings.playbook_count} playbook(s)"
-    if not errors:
-        return f"**Result:** ✅ No errors, {len(warnings)} warning(s). {checked}."
-    base_keys = {_finding_key(x) for x in base_findings.errors}
-    new = [x for x in errors if _finding_key(x) not in base_keys]
-    return (
-        f"**Result:** ❌ {len(errors)} error(s), {len(new)} of them new in this "
-        f"pull request, and {len(warnings)} warning(s). {checked}."
-    )
-
-
-# Playbook changes
-
-
-def _playbook_changes(
-    base: list[_Playbook],
-    head: list[_Playbook],
-    changed_files: list[_ChangedFile],
-    attention: list[str],
-) -> list[str]:
-    """Lists the added, deleted, renamed and changed playbooks.
-
-    Adds the changes reviewers should look at first to attention.
-    """
-    pairs, added, deleted = _match_playbooks(base, head)
-    rows: list[str] = []
-    sections: list[str] = []
-
-    for playbook in added:
-        steps = _flatten_steps(playbook.raw_data.get("steps"))
-        state = _enabled_state(playbook.raw_data)
-        rows.append(_row("Added", playbook, f"{len(steps)} step(s){state}"))
-        if playbook.raw_data.get("isEnabled") is True:
-            attention.append(f"{_bold(playbook.name)} is added and enabled")
-
-    for old, new in pairs:
-        changes = _changes(old, new, attention)
-        if changes:
-            change = "Renamed" if old.name != new.name else "Changed"
-            details = f"from {_bold(old.name)}" if change == "Renamed" else ""
-            rows.append(_row(change, new, details or f"{len(changes)} change(s)"))
-            if len(changes) > _MAX_CHANGES:
-                changes = changes[:_MAX_CHANGES] + [
-                    f"… and {len(changes) - _MAX_CHANGES} more changes"
-                ]
-            sections += [f"### {_md(new.name)}", ""] + [f"- {x}" for x in changes] + [""]
-        elif any(
-            _contains(p.path, x.path) or (x.old_path and _contains(p.path, x.old_path))
-            for p in (old, new)
-            for x in changed_files
-        ):
-            rows.append(
-                _row(
-                    "No content change",
-                    new,
-                    "Only the README, formatting, file names or timestamps changed",
-                )
-            )
-
-    for playbook in deleted:
-        rows.append(_row("Deleted", playbook, ""))
-        attention.append(
-            f"{_bold(playbook.name)} is deleted. sync-playbooks doesn't delete "
-            "playbooks, so it stays in SecOps and the next pull-playbooks adds it "
-            "back. Delete it in SecOps as well"
-        )
-
-    if not rows:
-        return ["No playbook changes.", ""]
-    table = ["| Change | Playbook | Folder | Details |", "|---|---|---|---|"] + rows
-    return table + [""] + sections
-
-
-def _match_playbooks(
-    base: list[_Playbook], head: list[_Playbook]
-) -> tuple[list[tuple[_Playbook, _Playbook]], list[_Playbook], list[_Playbook]]:
-    """Pairs each playbook with its base version.
-
-    Playbooks are matched by name, then by identifier, which a renamed playbook
-    keeps. A copied folder keeps the identifier too, but its original is
-    matched by name first.
-
-    Returns:
-        The pairs of base and head playbook, the added and the deleted playbooks.
-    """
-    unmatched = list(base)
-    pairs, rest, added = [], [], []
-    for playbook in head:
-        old = next((x for x in unmatched if x.name == playbook.name), None)
-        if old:
-            unmatched.remove(old)
-            pairs.append((old, playbook))
-        else:
-            rest.append(playbook)
-    for playbook in rest:
-        identifier = playbook.raw_data.get("identifier")
-        old = next(
-            (
-                x
-                for x in unmatched
-                if identifier and x.raw_data.get("identifier") == identifier
-            ),
-            None,
-        )
-        if old:
-            unmatched.remove(old)
-            pairs.append((old, playbook))
-        else:
-            added.append(playbook)
-    return pairs, added, unmatched
-
-
-def _changes(old: _Playbook, new: _Playbook, attention: list[str]) -> list[str]:
-    """Lists the changes of a playbook and adds the important ones to attention."""
-    changes = []
-    name = _bold(new.name)
-    if old.name != new.name:
-        changes.append(f"Renamed from {_bold(old.name)}")
-        attention.append(f"{_bold(old.name)} is renamed to {name}")
-    if old.path != new.path:
-        changes.append(f"Moved from {_code(old.path)} to {_code(new.path)}")
-
-    old_data, new_data = old.raw_data, new.raw_data
-    changes += _field_changes(old_data, new_data, ignore=_PARTS | {"name", "id"})
-    if _clean(old_data.get("isEnabled")) != _clean(new_data.get("isEnabled")):
-        state = "enabled" if new_data.get("isEnabled") else "disabled"
-        attention.append(f"{name} is now {state}")
-    if _clean(old_data.get("environments")) != _clean(new_data.get("environments")):
-        old_environments = _value(old_data.get("environments"))
-        new_environments = _value(new_data.get("environments"))
-        attention.append(
-            f"The environments of {name} changed: {old_environments} → {new_environments}"
-        )
-
-    old_trigger, new_trigger = old_data.get("trigger"), new_data.get("trigger")
-    if _clean(old_trigger) != _clean(new_trigger):
-        attention.append(f"The trigger of {name} changed")
-        if isinstance(old_trigger, dict) and isinstance(new_trigger, dict):
-            changes += [f"Trigger {x}" for x in _trigger_changes(old_trigger, new_trigger)]
-        else:
-            changes.append("Trigger changed")
-
-    old_steps = _flatten_steps(old_data.get("steps"))
-    new_steps = _flatten_steps(new_data.get("steps"))
-    step_changes = _step_changes(old_steps, new_steps)
-    removed = sum(1 for x in step_changes if x.startswith("Step removed"))
-    if removed:
-        attention.append(f"{removed} step(s) removed from {name}")
-    changes += step_changes
-
-    step_names = {
-        x["identifier"]: x.get("instanceName")
-        for x in old_steps + new_steps
-        if isinstance(x.get("identifier"), str)
-    }
-    changes += _relation_changes(old_data, new_data, step_names)
-    changes += _overview_changes(old_data, new_data)
-    for path in sorted(old.widgets.keys() | new.widgets.keys()):
-        if path not in old.widgets:
-            changes.append(f"Widget HTML added: {_code(path)}")
-        elif path not in new.widgets:
-            changes.append(f"Widget HTML removed: {_code(path)}")
-        elif old.widgets[path] != new.widgets[path]:
-            changes.append(f"Widget HTML changed: {_code(path)}")
-    return changes
-
-
-def _trigger_changes(old: dict, new: dict) -> list[str]:
-    changes = _field_changes(old, new, ignore={"id", "conditions"})
-    old_conditions = [_condition(x) for x in old.get("conditions") or []]
-    new_conditions = [_condition(x) for x in new.get("conditions") or []]
-    changes += [f"condition added: {x}" for x in new_conditions if x not in old_conditions]
-    changes += [
-        f"condition removed: {x}" for x in old_conditions if x not in new_conditions
-    ]
-    return changes
-
-
-def _condition(condition: object) -> str:
-    if not isinstance(condition, dict):
-        return _value(condition)
-    parts = [condition.get("fieldName"), condition.get("matchType"), condition.get("value")]
-    return _value(" ".join(str(x) for x in parts if x is not None))
-
-
-def _flatten_steps(steps: object) -> list[dict]:
-    """Lists the steps with their parallel actions, like sync-playbooks does."""
-    flat = []
-    for step in steps if isinstance(steps, list) else []:
-        if not isinstance(step, dict):
+def _playbook_files(files: dict[str, bytes], folder: str) -> dict:
+    """Picks the files of a playbook folder that utils.read_playbook_files reads."""
+    result = {}
+    for path, content in files.items():
+        if not path.startswith(f"{folder}/"):
             continue
-        flat.append(step)
-        children = step.get("parallelActions")
-        if isinstance(children, list):
-            flat += [x for x in children if isinstance(x, dict)]
-    return flat
+        name = path[len(folder) + 1 :]
+        subfolder, _, file_name = name.rpartition("/")
+        if subfolder in ("", PLAYBOOK_STEPS_DIR) and file_name.endswith(".json"):
+            result[name] = json.loads(content)
+        elif subfolder == PLAYBOOK_WIDGETS_DIR and file_name.endswith(".html"):
+            result[name] = content.decode("utf-8")
+    return result
 
 
-def _step_changes(old_steps: list[dict], new_steps: list[dict]) -> list[str]:
-    def by_key(steps: list[dict]) -> dict[str, dict]:
-        result: dict[str, dict] = {}
-        for step in steps:
-            result.setdefault(str(step.get("identifier") or step.get("instanceName")), step)
-        return result
-
-    old, new = by_key(old_steps), by_key(new_steps)
-    changes = [f"Step added: {_step_label(new[x])}" for x in new if x not in old]
-    changes += [f"Step removed: {_step_label(old[x])}" for x in old if x not in new]
-    for key in (x for x in new if x in old):
-        step_changes = _field_changes(
-            old[key], new[key], ignore={"parameters", "parallelActions"}
-        ) + _parameter_changes(old[key], new[key])
-        if step_changes:
-            name = new[key].get("instanceName") or key
-            changes.append(f"Step {_bold(name)} changed: {'; '.join(step_changes)}")
-    return changes
-
-
-def _step_label(step: dict) -> str:
-    label = _bold(step.get("instanceName") or step.get("identifier"))
-    action = " / ".join(
-        str(x) for x in (step.get("integration"), step.get("actionName")) if x
-    )
-    return f"{label} ({_md(action)})" if action else label
-
-
-def _parameter_changes(old_step: dict, new_step: dict) -> list[str]:
-    def by_name(step: dict) -> dict[str, dict]:
-        parameters = step.get("parameters")
-        if not isinstance(parameters, list):
-            return {}
-        return {str(x.get("name")): x for x in parameters if isinstance(x, dict)}
-
-    old, new = by_name(old_step), by_name(new_step)
-    changes = []
-    for name in sorted(old.keys() | new.keys()):
-        if name not in new:
-            changes.append(f"parameter `{name}` removed")
-        elif name not in old:
-            changes.append(f"parameter `{name}` added: {_value(new[name].get('value'))}")
-        elif _clean(old[name].get("value")) != _clean(new[name].get("value")):
-            change = _change(name, old[name].get("value"), new[name].get("value"))
-            changes.append(f"parameter {change}")
-        elif _clean(old[name]) != _clean(new[name]):
-            changes.append(f"parameter `{name}` changed")
-    return changes
-
-
-def _relation_changes(old_data: dict, new_data: dict, step_names: dict) -> list[str]:
-    def by_steps(data: dict) -> dict[tuple[str, str], dict]:
-        relations = data.get("stepsRelations")
-        result: dict[tuple[str, str], dict] = {}
-        for relation in relations if isinstance(relations, list) else []:
-            if isinstance(relation, dict):
-                key = (str(relation.get("fromStep")), str(relation.get("toStep")))
-                result.setdefault(key, relation)
-        return result
-
-    def label(key: tuple[str, str]) -> str:
-        return " → ".join(_bold(step_names.get(x) or x) for x in key)
-
-    old, new = by_steps(old_data), by_steps(new_data)
-    changes = [f"Connection added: {label(x)}" for x in sorted(new.keys() - old.keys())]
-    changes += [f"Connection removed: {label(x)}" for x in sorted(old.keys() - new.keys())]
-    for key in sorted(old.keys() & new.keys()):
-        relation_changes = _field_changes(old[key], new[key], ignore={"fromStep", "toStep"})
-        if relation_changes:
-            changes.append(
-                f"Connection {label(key)} changed: {'; '.join(relation_changes)}"
-            )
-    return changes
-
-
-def _overview_changes(old_data: dict, new_data: dict) -> list[str]:
-    def by_key(data: dict) -> dict[str, dict]:
-        templates = data.get("overviewTemplates")
-        return {
-            str(x.get("identifier") or x.get("name") or i): x
-            for i, x in enumerate(templates if isinstance(templates, list) else [])
-            if isinstance(x, dict)
-        }
-
-    old, new = by_key(old_data), by_key(new_data)
-    changes = []
-    for key in new.keys() | old.keys():
-        template = new[key] if key in new else old[key]
-        name = _bold(template.get("name") or key)
-        if key not in old:
-            changes.append(f"Overview template added: {name}")
-        elif key not in new:
-            changes.append(f"Overview template removed: {name}")
-        elif template_changes := _field_changes(old[key], new[key]):
-            changes.append(
-                f"Overview template {name} changed: {'; '.join(template_changes)}"
-            )
-    return sorted(changes)
-
-
-def _field_changes(
-    old: dict, new: dict, ignore: AbstractSet[str] = frozenset()
-) -> list[str]:
-    changes = []
-    for key in sorted(old.keys() | new.keys()):
-        if key in ignore or _is_timestamp(key):
-            continue
-        if key not in new:
-            changes.append(f"`{key}` removed")
-        elif key not in old:
-            changes.append(f"`{key}` added: {_value(new[key])}")
-        elif _clean(old[key]) != _clean(new[key]):
-            changes.append(_change(key, old[key], new[key]))
-    return changes
-
-
-def _change(key: str, old: object, new: object) -> str:
-    old_text, new_text = _json(old), _json(new)
-    if max(len(old_text), len(new_text)) > _MAX_VALUE_LENGTH:
-        return f"`{key}` changed"
-    return f"`{key}`: {_value(old)} → {_value(new)}"
-
-
-def _is_timestamp(key: object) -> bool:
-    return isinstance(key, str) and key.endswith("UnixTimeInMs")
-
-
-def _clean(value: object) -> object:
-    """Removes the timestamps the platform sets, which aren't changes to review."""
+def _without_timestamps(value: object) -> object:
+    """Removes the timestamps the platform sets on save. They aren't changes to review."""
     if isinstance(value, dict):
-        return {k: _clean(v) for k, v in value.items() if not _is_timestamp(k)}
+        return {
+            k: _without_timestamps(v)
+            for k, v in value.items()
+            if not k.endswith("UnixTimeInMs")
+        }
     if isinstance(value, list):
-        return [_clean(x) for x in value]
+        return [_without_timestamps(x) for x in value]
     return value
 
 
-def _enabled_state(raw_data: dict) -> str:
-    enabled = raw_data.get("isEnabled")
-    return ", enabled" if enabled is True else ", disabled" if enabled is False else ""
+# Comparing playbooks
 
 
-def _row(change: str, playbook: _Playbook, details: str) -> str:
-    return f"| {change} | {_bold(playbook.name)} | {_code(playbook.path)} | {details} |"
+def _compare_playbooks(
+    base: list[Playbook], head: list[Playbook]
+) -> list[PlaybookChange]:
+    """Lists the playbooks the merge request adds, changes, renames or deletes."""
+    pairs, deleted = _pair_playbooks(base, head)
+    changes = []
+    for old, new in pairs:
+        if old is None:
+            changes.append(PlaybookChange(None, new, []))
+        elif details := _differences(old, new):
+            changes.append(PlaybookChange(old, new, details))
+    changes += [PlaybookChange(old, None, []) for old in deleted]
+    return changes
 
 
-# Findings and other files
+def _pair_playbooks(
+    base: list[Playbook], head: list[Playbook]
+) -> tuple[list[tuple[Playbook | None, Playbook]], list[Playbook]]:
+    """Pairs every playbook with its base version, which is None for new playbooks.
+
+    Returns:
+        The pairs, and the base playbooks without a pair, which are deleted.
+    """
+    unmatched = list(base)
+    old_versions: list[Playbook | None] = []
+    # Match by name first, since a copied playbook keeps the identifier of its original
+    for new in head:
+        old = next((x for x in unmatched if x.name == new.name), None)
+        if old:
+            unmatched.remove(old)
+        old_versions.append(old)
+    # A renamed playbook keeps its identifier
+    for i, new in enumerate(head):
+        identifier = new.data.get("identifier")
+        if old_versions[i] is None and identifier:
+            old = next(
+                (x for x in unmatched if x.data.get("identifier") == identifier), None
+            )
+            if old:
+                unmatched.remove(old)
+            old_versions[i] = old
+    return list(zip(old_versions, head, strict=True)), unmatched
 
 
-def _finding_key(issue: Issue) -> tuple[str, str, str]:
-    # Lines move when files change, so they aren't part of the key
-    return issue.severity, issue.path, issue.message
-
-
-def _findings(base_findings: Report, head_findings: Report) -> list[str]:
-    base_keys = {_finding_key(x) for x in base_findings.issues}
-    head_keys = {_finding_key(x) for x in head_findings.issues}
-    head_issues, base_issues = head_findings.issues, base_findings.issues
-    groups = [
-        (
-            "New in this pull request",
-            [x for x in head_issues if _finding_key(x) not in base_keys],
-        ),
-        (
-            "Already on the base branch",
-            [x for x in head_issues if _finding_key(x) in base_keys],
-        ),
-        (
-            "Fixed by this pull request",
-            [x for x in base_issues if _finding_key(x) not in head_keys],
-        ),
-    ]
+def _differences(old: Playbook, new: Playbook) -> list[str]:
+    """Describes how a playbook changed, one line per change."""
     lines = []
-    for title, issues in groups:
+    if old.name != new.name:
+        lines.append(f"Renamed from {_quote(old.name)}")
+    if old.path != new.path:
+        lines.append(f"Moved from {old.path} to {new.path}")
+    lines += _field_differences(old.data, new.data, ignore=_PARTS)
+
+    old_trigger, new_trigger = _dict(old.data.get("trigger")), _dict(new.data.get("trigger"))
+    lines += [f"Trigger {x}" for x in _field_differences(old_trigger, new_trigger)]
+
+    lines += _step_differences(old.data, new.data)
+    lines += _connection_differences(old.data, new.data)
+    if old.data.get("overviewTemplates") != new.data.get("overviewTemplates"):
+        lines.append("The overview templates or their widgets changed")
+    return lines
+
+
+def _step_differences(old_data: dict, new_data: dict) -> list[str]:
+    old, new = _steps(old_data), _steps(new_data)
+    lines = [f"Step added: {_step_label(x)}" for key, x in new.items() if key not in old]
+    lines += [f"Step removed: {_step_label(x)}" for key, x in old.items() if key not in new]
+    for key, step in new.items():
+        if key not in old:
+            continue
+        changes = _field_differences(
+            old[key], step, ignore={"parameters", "parallelActions"}
+        )
+        changes += [
+            f"parameter {x}"
+            for x in _field_differences(_parameters(old[key]), _parameters(step))
+        ]
+        if changes:
+            name = _quote(step.get("instanceName") or key)
+            lines.append(f"Step {name} changed: {'; '.join(changes)}")
+    return lines
+
+
+def _connection_differences(old_data: dict, new_data: dict) -> list[str]:
+    old, new = _connections(old_data), _connections(new_data)
+    steps = {**_steps(old_data), **_steps(new_data)}
+
+    def label(connection: tuple[str, str]) -> str:
+        return " -> ".join(
+            _quote(steps.get(x, {}).get("instanceName") or x) for x in connection
+        )
+
+    lines = [f"Connection added: {label(x)}" for x in sorted(new - old)]
+    lines += [f"Connection removed: {label(x)}" for x in sorted(old - new)]
+    return lines
+
+
+def _field_differences(
+    old: dict, new: dict, ignore: Container[str] = ()
+) -> list[str]:
+    """Describes the keys whose values differ, one line per key."""
+    lines = []
+    for key in sorted(old.keys() | new.keys()):
+        if key in ignore:
+            continue
+        if key not in new:
+            lines.append(f"{key} removed")
+        elif key not in old:
+            value = _short_json(new[key])
+            lines.append(f"{key} added" + (f": {value}" if value else ""))
+        elif old[key] != new[key]:
+            before, after = _short_json(old[key]), _short_json(new[key])
+            if before and after:
+                lines.append(f"{key}: {before} -> {after}")
+            else:
+                lines.append(f"{key} changed")
+    return lines
+
+
+def _steps(data: dict) -> dict[str, dict]:
+    """Returns the steps of a playbook and their parallel actions, by identifier."""
+    steps = [x for x in _list(data.get("steps")) if isinstance(x, dict)]
+    steps += [
+        x
+        for step in steps
+        for x in _list(step.get("parallelActions"))
+        if isinstance(x, dict)
+    ]
+    return {str(x.get("identifier") or x.get("instanceName")): x for x in steps}
+
+
+def _parameters(step: dict) -> dict[str, object]:
+    """Returns the parameter values of a step, by parameter name."""
+    return {
+        str(x.get("name")): x.get("value")
+        for x in _list(step.get("parameters"))
+        if isinstance(x, dict)
+    }
+
+
+def _connections(data: dict) -> set[tuple[str, str]]:
+    """Returns the connections between the steps, as (from, to) step identifiers."""
+    return {
+        (str(x.get("fromStep")), str(x.get("toStep")))
+        for x in _list(data.get("stepsRelations"))
+        if isinstance(x, dict)
+    }
+
+
+def _step_label(step: dict) -> str:
+    label = _quote(step.get("instanceName") or step.get("identifier"))
+    action = " / ".join(
+        str(x) for x in (step.get("integration"), step.get("actionName")) if x
+    )
+    return f"{label} ({action})" if action else label
+
+
+# Report sections
+
+
+def _summary(
+    head: str,
+    base: str,
+    merge_base: str,
+    findings: Report,
+    in_changed_playbooks: list[Issue],
+) -> str:
+    if merge_base.startswith(base):
+        compared = f"its merge base {merge_base[:7]}"
+    else:
+        compared = f"{base} (merge base {merge_base[:7]})"
+
+    errors, warnings = findings.errors, findings.warnings
+    changed_errors = [x for x in in_changed_playbooks if x.severity == ERROR]
+    if errors:
+        result = (
+            f"{len(errors)} error(s), {len(changed_errors)} of them in playbooks "
+            f"this merge request changes, and {len(warnings)} warning(s)"
+        )
+    else:
+        result = f"no errors, {len(warnings)} warning(s)"
+
+    return "\n".join(
+        [
+            "VALIDATION REPORT",
+            f"Compares HEAD ({head[:7]}) with {compared}.",
+            f"Result: {result}. Checked {findings.playbook_count} playbook(s).",
+        ]
+    )
+
+
+def _section(title: str, lines: list[str]) -> str:
+    """Formats a section: the title in capitals and the lines indented under it."""
+    return "\n".join([title.upper()] + [f"  {x}" for x in lines or ["None."]])
+
+
+def _attention(changes: list[PlaybookChange], changed_files: list[ChangedFile]) -> list[str]:
+    """Lists the changes reviewers should look at first."""
+    lines = []
+    for change in changes:
+        old, new = change.old, change.new
+        name = _quote(change.playbook.name)
+        if old is None:
+            if new.data.get("isEnabled") is True:
+                lines.append(f"{name} is added and enabled")
+        elif new is None:
+            lines.append(
+                f"{name} is deleted. sync-playbooks doesn't delete playbooks, so it "
+                "stays in SecOps and the next pull-playbooks adds it back. "
+                "Delete it in SecOps as well"
+            )
+        else:
+            if old.name != new.name:
+                lines.append(f"{_quote(old.name)} is renamed to {name}")
+            if old.data.get("isEnabled") != new.data.get("isEnabled"):
+                state = "enabled" if new.data.get("isEnabled") else "disabled"
+                lines.append(f"{name} is now {state}")
+            if old.data.get("environments") != new.data.get("environments"):
+                lines.append(f"The environments of {name} changed")
+            if old.data.get("trigger") != new.data.get("trigger"):
+                lines.append(f"The trigger of {name} changed")
+            removed = len(_steps(old.data).keys() - _steps(new.data).keys())
+            if removed:
+                lines.append(f"{removed} step(s) removed from {name}")
+
+    tool_files = [x.path for x in changed_files if _is_tool_file(x.path)]
+    if tool_files:
+        lines.append(f"The sync tool or its pipeline changed: {', '.join(tool_files)}")
+    return [f"- {x}" for x in lines]
+
+
+def _playbook_lines(changes: list[PlaybookChange]) -> list[str]:
+    """Lists every changed playbook, with what changed indented under it."""
+    lines = []
+    for change in changes:
+        playbook = change.playbook
+        lines.append(f"{change.kind}: {_quote(playbook.name)} ({playbook.path})")
+        lines += [f"  - {x}" for x in change.details]
+    return lines
+
+
+def _finding_lines(findings: Report, in_changed_playbooks: list[Issue]) -> list[str]:
+    groups = {
+        "In playbooks this merge request changes": in_changed_playbooks,
+        "In other playbooks": [
+            x for x in findings.issues if x not in in_changed_playbooks
+        ],
+    }
+    lines = []
+    for title, issues in groups.items():
         if issues:
-            lines += [f"### {title} ({len(issues)})", ""]
-            lines += [_finding(x) for x in issues] + [""]
-    return lines or ["No findings.", ""]
+            lines.append(f"{title} ({len(issues)}):")
+            lines += [f"  {_finding(x)}" for x in issues]
+    return lines
 
 
 def _finding(issue: Issue) -> str:
-    icon = "❌ Error" if issue.severity == ERROR else "⚠️ Warning"
+    severity = "ERROR" if issue.severity == ERROR else "WARNING"
     location = f"{issue.path}:{issue.line}" if issue.line else issue.path
-    return f"- {icon} {_code(location)}: {_md(issue.message)}"
+    return f"{severity} {location}: {issue.message}"
 
 
-def _file_attention(changed_files: list[_ChangedFile]) -> list[str]:
-    tool = [
-        x.path
-        for x in changed_files
-        if (
-            x.path.endswith(".py")
-            and not x.path.startswith(("tests/", f"{INTEGRATIONS_PATH}/"))
-        )
-        or x.path == "requirements.txt"
-    ]
-    checks = [x.path for x in changed_files if x.path.startswith(".github/")]
-    attention = []
-    if tool:
-        attention.append(
-            "The sync tool's code changed: " + ", ".join(_code(x) for x in tool)
-        )
-    if checks:
-        attention.append(
-            "The GitHub configuration, which runs these checks, changed: "
-            + ", ".join(_code(x) for x in checks)
-        )
-    return attention
+def _is_changed(path: str, playbook_paths: list[str], changed_paths: list[str]) -> bool:
+    """Whether the merge request changes the playbook of a path, or the path itself."""
+    playbook = next((x for x in playbook_paths if _is_in(path, x)), path)
+    return any(_is_in(x, playbook) for x in changed_paths)
 
 
-def _file_table(files: list[_ChangedFile]) -> list[str]:
-    if not files:
-        return ["None.", ""]
-    statuses = {
-        "A": "Added",
-        "M": "Modified",
-        "D": "Deleted",
-        "R": "Renamed",
-        "C": "Copied",
-    }
-    lines = ["| File | Change | Lines |", "|---|---|---|"]
-    for file in files:
-        path = _code(file.path)
-        if file.old_path:
-            path = f"{_code(file.old_path)} → {path}"
-        if file.lines_added is None:
-            counts = "binary"
-        else:
-            counts = f"+{file.lines_added} −{file.lines_deleted}"
-        lines.append(f"| {path} | {statuses.get(file.status, file.status)} | {counts} |")
-    return lines + [""]
+def _is_tool_file(path: str) -> bool:
+    """Whether the file belongs to the sync tool or the pipeline that checks it."""
+    # Integrations holds the code of the pulled integrations, not of this tool
+    is_code = path.endswith(".py") and not path.startswith(
+        ("tests/", f"{INTEGRATIONS_PATH}/")
+    )
+    return is_code or path in ("requirements.txt", ".gitlab-ci.yml")
 
 
-# Markdown
+# Small helpers
 
 
-def _md(text: object) -> str:
-    """Escapes text for Markdown."""
-    return re.sub(r"([\\`*_\[\]<>|])", r"\\\1", str(text))
+def _quote(name: object) -> str:
+    return f"'{name}'"
 
 
-def _code(text: str) -> str:
-    # A pipe ends a table cell even in code
-    return "`" + text.replace("`", "'").replace("|", "\\|") + "`"
+def _short_json(value: object) -> str | None:
+    """Returns the value as JSON, or None if it's too long to show."""
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return text if len(text) <= _MAX_VALUE_LENGTH else None
 
 
-def _bold(text: object) -> str:
-    return f"**{_md(text)}**"
+def _list(value: object) -> list:
+    return value if isinstance(value, list) else []
 
 
-def _json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+def _dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
 
 
-def _value(value: object) -> str:
-    text = _json(value)
-    if len(text) > _MAX_VALUE_LENGTH:
-        text = text[: _MAX_VALUE_LENGTH - 1] + "…"
-    return "`" + text.replace("`", "'") + "`"
+def _is_in(path: str, folder: str) -> bool:
+    return path == folder or path.startswith(f"{folder}/")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Prints a Markdown report of what a pull request changes "
+        description="Prints a report of what a merge request changes "
         "and what the validation finds."
     )
     parser.add_argument(
         "--base",
         default="origin/main",
-        help="Branch or commit the pull request is merged into (default: origin/main)",
+        help="Branch or commit the merge request is merged into (default: origin/main)",
     )
     args = parser.parse_args()
     try:
         repo_root = _git(".", "rev-parse", "--show-toplevel").decode().strip()
-        report = build_report(repo_root, args.base)
+        print(build_report(repo_root, args.base))
     except ReportError as e:
         print(f"Can't build the report: {e}", file=sys.stderr)
         sys.exit(2)
-    print(report)
 
 
 if __name__ == "__main__":

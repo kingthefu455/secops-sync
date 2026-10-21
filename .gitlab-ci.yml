@@ -1,0 +1,47 @@
+# Checks every merge request before it is merged. Needs no SecOps credentials
+# and makes no API calls.
+
+default:
+  image: python:3.13
+  before_script:
+    - pip install -r requirements.txt
+
+.merge_request_only:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+stages:
+  - validate
+
+# Fails the merge request pipeline on errors
+validate:
+  stage: validate
+  extends: .merge_request_only
+  script:
+    - pip install ruff==0.17.1
+    # Syntax errors and undefined names. Integrations holds the code of the
+    # pulled integrations, not of this tool.
+    - ruff check --isolated --select E9,F63,F7,F82 --extend-exclude Integrations .
+    - python main.py --help
+    - python -m unittest discover -s tests -v
+    - python main.py validate-playbooks
+
+# Prints the report of the changes and findings of the merge request to the
+# job log, and creates no files. Runs next to validate, so it also runs when a
+# check fails, and only fails if it can't build the report.
+validation-report:
+  stage: validate
+  extends: .merge_request_only
+  variables:
+    # The report compares the merge request with its merge base, so it needs
+    # the history, not the default shallow clone
+    GIT_DEPTH: "0"
+    # Trusts the checkout even if the runner cloned it as another user,
+    # without writing a git config file
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: safe.directory
+    GIT_CONFIG_VALUE_0: $CI_PROJECT_DIR
+    # Python doesn't write .pyc cache files either
+    PYTHONDONTWRITEBYTECODE: "1"
+  script:
+    - python validation_report.py --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
