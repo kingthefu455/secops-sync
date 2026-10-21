@@ -116,14 +116,13 @@ class BuildReportTest(unittest.TestCase):
             "- **Malware** is renamed to **Malware Response**",
             "- **New Playbook** is added and enabled",
             "- **Old Block** is deleted. sync-playbooks doesn't delete playbooks",
-            "- The sync tool's code changed: `main.py`",
+            "- The sync tool or its pipeline changed: `main.py`",
             # Playbook changes
-            "| Added | **New Playbook** | `Playbooks/Default/new_playbook` | 3 step(s), enabled |",
-            "| Changed | **Phishing Triage** |",
-            "| Renamed | **Malware Response** | `Playbooks/Default/malware_response` "
-            "| from **Malware** |",
-            "| No content change | **Reformatted** |",
-            "| Deleted | **Old Block** |",
+            "| Added | **New Playbook** | `Playbooks/Default/new_playbook` |",
+            "| Changed | **Phishing Triage** | `Playbooks/Default/phishing_triage` |",
+            "| Renamed | **Malware Response** | `Playbooks/Default/malware_response` |",
+            "| Deleted | **Old Block** | `Playbooks/Default/old_block` |",
+            "- Renamed from **Malware**",
             "- `isEnabled`: `true` → `false`",
             '- Trigger `type`: `"ALL"` → `"TAG_NAME"`',
             f'- Step **Get Case Data** changed: parameter `IntegrationInstance`: `null` → `"{INSTANCE_ID}"`',
@@ -139,11 +138,17 @@ class BuildReportTest(unittest.TestCase):
             "### Fixed by this merge request (1)",
             "- ❌ Error `Playbooks/Default/to_fix/steps/get_case_data_aaaaa.json`:",
             # Other files
-            "| `main.py` | Modified | +1 −1 |",
+            "| `main.py` | Modified |",
         ):
             self.assertIn(line, report)
         # The fixed playbook only changed in the step with the error
-        self.assertIn("| Changed | **To Fix** |", report)
+        self.assertIn(
+            "- Step **Get Case Data** changed: parameter `FallbackIntegrationInstance` "
+            "added: `null`; parameter `IntegrationInstance` added: `null`",
+            report,
+        )
+        # Reformatting a playbook doesn't change it
+        self.assertNotIn("Reformatted", report)
         self.assertNotIn("Playbooks/", report.split("## Other changed files")[1])
 
     def test_no_changes(self):
