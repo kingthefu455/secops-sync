@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prints a Markdown report of what a merge request changes and what the validation finds.
+"""Prints a report of what a merge request changes and what the validation finds.
 
     python validation_report.py --base origin/main
 
@@ -37,7 +37,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from collections.abc import Container
@@ -120,12 +119,12 @@ def build_report(repo_root: str, base: str) -> str:
 
     sections = [
         _summary(head, base, merge_base, findings, in_changed_playbooks),
-        _attention_section(changes, changed_files),
-        _playbooks_section(changes),
-        _findings_section(findings, in_changed_playbooks),
-        _files_section(other_files),
+        _section("Needs attention", _attention(changes, changed_files)),
+        _section("Playbook changes", _playbook_lines(changes)),
+        _section("Findings", _finding_lines(findings, in_changed_playbooks)),
+        _section("Other changed files", [f"{x.status}: {x.path}" for x in other_files]),
     ]
-    return "\n\n".join(x for x in sections if x)
+    return "\n\n".join(sections)
 
 
 # Reading from git
@@ -301,9 +300,9 @@ def _differences(old: Playbook, new: Playbook) -> list[str]:
     """Describes how a playbook changed, one line per change."""
     lines = []
     if old.name != new.name:
-        lines.append(f"Renamed from {_bold(old.name)}")
+        lines.append(f"Renamed from {_quote(old.name)}")
     if old.path != new.path:
-        lines.append(f"Moved from {_code(old.path)} to {_code(new.path)}")
+        lines.append(f"Moved from {old.path} to {new.path}")
     lines += _field_differences(old.data, new.data, ignore=_PARTS)
 
     old_trigger, new_trigger = _dict(old.data.get("trigger")), _dict(new.data.get("trigger"))
@@ -331,7 +330,7 @@ def _step_differences(old_data: dict, new_data: dict) -> list[str]:
             for x in _field_differences(_parameters(old[key]), _parameters(step))
         ]
         if changes:
-            name = _bold(step.get("instanceName") or key)
+            name = _quote(step.get("instanceName") or key)
             lines.append(f"Step {name} changed: {'; '.join(changes)}")
     return lines
 
@@ -341,8 +340,8 @@ def _connection_differences(old_data: dict, new_data: dict) -> list[str]:
     steps = {**_steps(old_data), **_steps(new_data)}
 
     def label(connection: tuple[str, str]) -> str:
-        return " → ".join(
-            _bold(steps.get(x, {}).get("instanceName") or x) for x in connection
+        return " -> ".join(
+            _quote(steps.get(x, {}).get("instanceName") or x) for x in connection
         )
 
     lines = [f"Connection added: {label(x)}" for x in sorted(new - old)]
@@ -359,16 +358,16 @@ def _field_differences(
         if key in ignore:
             continue
         if key not in new:
-            lines.append(f"`{key}` removed")
+            lines.append(f"{key} removed")
         elif key not in old:
             value = _short_json(new[key])
-            lines.append(f"`{key}` added" + (f": {_code(value)}" if value else ""))
+            lines.append(f"{key} added" + (f": {value}" if value else ""))
         elif old[key] != new[key]:
             before, after = _short_json(old[key]), _short_json(new[key])
             if before and after:
-                lines.append(f"`{key}`: {_code(before)} → {_code(after)}")
+                lines.append(f"{key}: {before} -> {after}")
             else:
-                lines.append(f"`{key}` changed")
+                lines.append(f"{key} changed")
     return lines
 
 
@@ -403,11 +402,11 @@ def _connections(data: dict) -> set[tuple[str, str]]:
 
 
 def _step_label(step: dict) -> str:
-    label = _bold(step.get("instanceName") or step.get("identifier"))
+    label = _quote(step.get("instanceName") or step.get("identifier"))
     action = " / ".join(
         str(x) for x in (step.get("integration"), step.get("actionName")) if x
     )
-    return f"{label} ({_md(action)})" if action else label
+    return f"{label} ({action})" if action else label
 
 
 # Report sections
@@ -421,37 +420,40 @@ def _summary(
     in_changed_playbooks: list[Issue],
 ) -> str:
     if merge_base.startswith(base):
-        compared = f"its merge base `{merge_base[:7]}`"
+        compared = f"its merge base {merge_base[:7]}"
     else:
-        compared = f"`{base}` (merge base `{merge_base[:7]}`)"
+        compared = f"{base} (merge base {merge_base[:7]})"
 
     errors, warnings = findings.errors, findings.warnings
     changed_errors = [x for x in in_changed_playbooks if x.severity == ERROR]
     if errors:
         result = (
-            f"❌ {len(errors)} error(s), {len(changed_errors)} of them in playbooks "
+            f"{len(errors)} error(s), {len(changed_errors)} of them in playbooks "
             f"this merge request changes, and {len(warnings)} warning(s)"
         )
     else:
-        result = f"✅ No errors, {len(warnings)} warning(s)"
+        result = f"no errors, {len(warnings)} warning(s)"
 
-    return "\n\n".join(
+    return "\n".join(
         [
-            "# Validation report",
-            f"Compares `HEAD` (`{head[:7]}`) with {compared}.",
-            f"**Result:** {result}. Checked {findings.playbook_count} playbook(s).",
+            "VALIDATION REPORT",
+            f"Compares HEAD ({head[:7]}) with {compared}.",
+            f"Result: {result}. Checked {findings.playbook_count} playbook(s).",
         ]
     )
 
 
-def _attention_section(
-    changes: list[PlaybookChange], changed_files: list[ChangedFile]
-) -> str:
+def _section(title: str, lines: list[str]) -> str:
+    """Formats a section: the title in capitals and the lines indented under it."""
+    return "\n".join([title.upper()] + [f"  {x}" for x in lines or ["None."]])
+
+
+def _attention(changes: list[PlaybookChange], changed_files: list[ChangedFile]) -> list[str]:
     """Lists the changes reviewers should look at first."""
     lines = []
     for change in changes:
         old, new = change.old, change.new
-        name = _bold(change.playbook.name)
+        name = _quote(change.playbook.name)
         if old is None:
             if new.data.get("isEnabled") is True:
                 lines.append(f"{name} is added and enabled")
@@ -463,7 +465,7 @@ def _attention_section(
             )
         else:
             if old.name != new.name:
-                lines.append(f"{_bold(old.name)} is renamed to {name}")
+                lines.append(f"{_quote(old.name)} is renamed to {name}")
             if old.data.get("isEnabled") != new.data.get("isEnabled"):
                 state = "enabled" if new.data.get("isEnabled") else "disabled"
                 lines.append(f"{name} is now {state}")
@@ -477,59 +479,39 @@ def _attention_section(
 
     tool_files = [x.path for x in changed_files if _is_tool_file(x.path)]
     if tool_files:
-        files = ", ".join(_code(x) for x in tool_files)
-        lines.append(f"The sync tool or its pipeline changed: {files}")
-
-    if not lines:
-        return ""
-    return "## Needs attention\n\n" + "\n".join(f"- {x}" for x in lines)
+        lines.append(f"The sync tool or its pipeline changed: {', '.join(tool_files)}")
+    return [f"- {x}" for x in lines]
 
 
-def _playbooks_section(changes: list[PlaybookChange]) -> str:
-    if not changes:
-        return "## Playbook changes\n\nNo playbook changes."
-    lines = ["## Playbook changes", "", "| Change | Playbook | Folder |", "|---|---|---|"]
+def _playbook_lines(changes: list[PlaybookChange]) -> list[str]:
+    """Lists every changed playbook, with what changed indented under it."""
+    lines = []
     for change in changes:
         playbook = change.playbook
-        lines.append(
-            f"| {change.kind} | {_bold(playbook.name)} | {_cell(_code(playbook.path))} |"
-        )
-    for change in changes:
-        if change.details:
-            lines += ["", f"### {_md(change.playbook.name)}", ""]
-            lines += [f"- {x}" for x in change.details]
-    return "\n".join(lines)
+        lines.append(f"{change.kind}: {_quote(playbook.name)} ({playbook.path})")
+        lines += [f"  - {x}" for x in change.details]
+    return lines
 
 
-def _findings_section(findings: Report, in_changed_playbooks: list[Issue]) -> str:
+def _finding_lines(findings: Report, in_changed_playbooks: list[Issue]) -> list[str]:
     groups = {
         "In playbooks this merge request changes": in_changed_playbooks,
         "In other playbooks": [
             x for x in findings.issues if x not in in_changed_playbooks
         ],
     }
-    lines = ["## Findings"]
+    lines = []
     for title, issues in groups.items():
         if issues:
-            lines += ["", f"### {title} ({len(issues)})", ""]
-            lines += [_finding(x) for x in issues]
-    if len(lines) == 1:
-        lines += ["", "No findings."]
-    return "\n".join(lines)
-
-
-def _files_section(files: list[ChangedFile]) -> str:
-    if not files:
-        return "## Other changed files\n\nNone."
-    lines = ["## Other changed files", "", "| File | Change |", "|---|---|"]
-    lines += [f"| {_cell(_code(x.path))} | {x.status} |" for x in files]
-    return "\n".join(lines)
+            lines.append(f"{title} ({len(issues)}):")
+            lines += [f"  {_finding(x)}" for x in issues]
+    return lines
 
 
 def _finding(issue: Issue) -> str:
-    icon = "❌ Error" if issue.severity == ERROR else "⚠️ Warning"
+    severity = "ERROR" if issue.severity == ERROR else "WARNING"
     location = f"{issue.path}:{issue.line}" if issue.line else issue.path
-    return f"- {icon} {_code(location)}: {_md(issue.message)}"
+    return f"{severity} {location}: {issue.message}"
 
 
 def _is_changed(path: str, playbook_paths: list[str], changed_paths: list[str]) -> bool:
@@ -550,22 +532,8 @@ def _is_tool_file(path: str) -> bool:
 # Small helpers
 
 
-def _md(text: object) -> str:
-    """Escapes text for Markdown."""
-    return re.sub(r"([\\`*_\[\]<>|])", r"\\\1", str(text))
-
-
-def _bold(text: object) -> str:
-    return f"**{_md(text)}**"
-
-
-def _code(text: str) -> str:
-    return "`" + text.replace("`", "'") + "`"
-
-
-def _cell(text: str) -> str:
-    """Escapes a table cell. A pipe ends the cell, even in code."""
-    return text.replace("|", "\\|")
+def _quote(name: object) -> str:
+    return f"'{name}'"
 
 
 def _short_json(value: object) -> str | None:
@@ -588,7 +556,7 @@ def _is_in(path: str, folder: str) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Prints a Markdown report of what a merge request changes "
+        description="Prints a report of what a merge request changes "
         "and what the validation finds."
     )
     parser.add_argument(

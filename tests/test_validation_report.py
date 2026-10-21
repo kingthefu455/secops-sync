@@ -154,61 +154,68 @@ class BuildReportTest(unittest.TestCase):
         report = build_report(self.repo, "main")
 
         self.assertIn(
-            "**Result:** ❌ 2 error(s), 1 of them in playbooks this merge request "
-            "changes, and 0 warning(s). Checked 6 playbook(s).",
+            "Result: 2 error(s), 1 of them in playbooks this merge request changes, "
+            "and 0 warning(s). Checked 6 playbook(s).",
             report,
         )
         for line in (
             # Needs attention
-            "- **Phishing Triage** is now disabled",
-            "- The trigger of **Phishing Triage** changed",
-            "- 2 step(s) removed from **Phishing Triage**",
-            "- **Malware** is renamed to **Malware Response**",
-            "- **New Playbook** is added and enabled",
-            "- **Old Block** is deleted. sync-playbooks doesn't delete playbooks",
-            "- The sync tool or its pipeline changed: `main.py`",
+            "  - 'Phishing Triage' is now disabled",
+            "  - The trigger of 'Phishing Triage' changed",
+            "  - 2 step(s) removed from 'Phishing Triage'",
+            "  - 'Malware' is renamed to 'Malware Response'",
+            "  - 'New Playbook' is added and enabled",
+            "  - 'Old Block' is deleted. sync-playbooks doesn't delete playbooks",
+            "  - The sync tool or its pipeline changed: main.py",
             # Playbook changes
-            "| Added | **New Playbook** | `Playbooks/Default/new_playbook` |",
-            "| Changed | **Phishing Triage** | `Playbooks/Default/phishing_triage` |",
-            "| Renamed | **Malware Response** | `Playbooks/Default/malware_response` |",
-            "| Deleted | **Old Block** | `Playbooks/Default/old_block` |",
-            "- Renamed from **Malware**",
-            "- `isEnabled`: `true` → `false`",
-            '- Trigger `type`: `"ALL"` → `"TAG_NAME"`',
-            f'- Step **Get Case Data** changed: parameter `IntegrationInstance`: `null` → `"{INSTANCE_ID}"`',
-            "- Step removed: **Enrich**",
-            "- Step removed: **Enrich IP** (VirusTotal)",
-            "- Connection removed: **Get Case Data** → **Enrich**",
-            "- Moved from `Playbooks/Default/malware` to `Playbooks/Default/malware_response`",
+            "  Added: 'New Playbook' (Playbooks/Default/new_playbook)",
+            "  Changed: 'Phishing Triage' (Playbooks/Default/phishing_triage)",
+            "  Renamed: 'Malware Response' (Playbooks/Default/malware_response)",
+            "  Deleted: 'Old Block' (Playbooks/Default/old_block)",
+            "    - Renamed from 'Malware'",
+            "    - Moved from Playbooks/Default/malware to Playbooks/Default/malware_response",
+            "    - isEnabled: true -> false",
+            '    - Trigger type: "ALL" -> "TAG_NAME"',
+            "    - Step removed: 'Enrich'",
+            "    - Step removed: 'Enrich IP' (VirusTotal)",
+            "    - Step 'Get Case Data' changed: parameter IntegrationInstance: "
+            f'null -> "{INSTANCE_ID}"',
+            "    - Connection removed: 'Get Case Data' -> 'Enrich'",
             # Findings
-            "### In playbooks this merge request changes (1)",
-            "- ❌ Error `Playbooks/Default/new_playbook/steps/enrich_bbbbb.json`:",
-            "### In other playbooks (1)",
-            "- ❌ Error `Playbooks/Default/broken/steps/get_case_data_aaaaa.json`:",
+            "  In playbooks this merge request changes (1):\n"
+            "    ERROR Playbooks/Default/new_playbook/steps/enrich_bbbbb.json: ",
+            "  In other playbooks (1):\n"
+            "    ERROR Playbooks/Default/broken/steps/get_case_data_aaaaa.json: ",
             # Other files
-            "| `main.py` | Modified |",
+            "OTHER CHANGED FILES\n  Modified: main.py",
         ):
             self.assertIn(line, report)
         # The fixed playbook only changed in the step with the error
         self.assertIn(
-            "- Step **Get Case Data** changed: parameter `FallbackIntegrationInstance` "
-            "added: `null`; parameter `IntegrationInstance` added: `null`",
+            "    - Step 'Get Case Data' changed: parameter FallbackIntegrationInstance "
+            "added: null; parameter IntegrationInstance added: null",
             report,
         )
         # The fixed error is gone
         self.assertNotIn("to_fix/steps/get_case_data_aaaaa.json", report)
         # Reformatting a playbook doesn't change it
         self.assertNotIn("Reformatted", report)
-        self.assertNotIn("Playbooks/", report.split("## Other changed files")[1])
+        # The report is plain text
+        for markdown in ("#", "**", "`", "|"):
+            self.assertNotIn(markdown, report)
 
     def test_no_changes(self):
         write_playbook(self.repo, make_playbook())
         self.commit()
         report = build_report(self.repo, "main")
-        self.assertIn("**Result:** ✅ No errors, 0 warning(s). Checked 1 playbook(s).", report)
-        self.assertIn("No playbook changes.", report)
-        self.assertIn("No findings.", report)
-        self.assertNotIn("## Needs attention", report)
+        self.assertIn(
+            "Result: no errors, 0 warning(s). Checked 1 playbook(s).\n\n"
+            "NEEDS ATTENTION\n  None.\n\n"
+            "PLAYBOOK CHANGES\n  None.\n\n"
+            "FINDINGS\n  None.\n\n"
+            "OTHER CHANGED FILES\n  None.",
+            report,
+        )
 
     def test_creates_no_files(self):
         write_playbook(self.repo, make_playbook())
